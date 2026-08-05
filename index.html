@@ -6,7 +6,7 @@
 <meta name="theme-color" content="#1a1a1a" />
 <link rel="manifest" href="./manifest.json" />
 <link rel="apple-touch-icon" href="./icon-192.png" />
-<title>Voice Note to Text</title>
+<title>Voice Note_1 to Text</title>
 <style>
   :root {
     color-scheme: dark;
@@ -14,6 +14,13 @@
     --light-green: #86efac;
     --red: #dc2626;
     --light-red: #fca5a5;
+    --blue: #3b82f6;
+    --teal: #14b8a6;
+    --amber: #eab308;
+    --purple: #a855f7;
+    --indigo: #6366f1;
+    --slate: #64748b;
+    --sky: #0ea5e9;
   }
   * { box-sizing: border-box; }
   body {
@@ -22,120 +29,210 @@
     font-family: -apple-system, system-ui, sans-serif;
     max-width: 560px; margin-inline: auto;
   }
-  h1 { font-size: 1.1rem; font-weight: 600; color: #aaa; margin: 0 0 16px; }
+
+  .header-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
+  h1 { font-size: 1.1rem; font-weight: 600; color: #aaa; margin: 0; }
+  .icon-btn {
+    width: 36px; height: 36px; border-radius: 50%; padding: 0; margin: 0;
+    font-size: 1.05rem; font-weight: 700; background: var(--slate); color: #fff;
+    flex-shrink: 0; display: flex; align-items: center; justify-content: center;
+  }
+
   button {
     font: inherit; border: none; border-radius: 10px;
     padding: 14px 18px; font-size: 1rem; font-weight: 600;
-    cursor: pointer; width: 100%; margin-top: 10px; color: #10251a;
+    cursor: pointer; width: 100%; margin-top: 10px;
   }
   button:disabled { opacity: 0.5; }
-  .secondary { background: #2a2a2a; color: #eee; }
-  .secondary:active { background: #383838; }
-  .danger-text { color: #f87171; }
 
-  #recordBtn { background: var(--green); font-size: 1.1rem; padding: 18px; }
-  #pauseBtn { background: var(--light-red); display: none; }
-  #resumeBtn { background: var(--light-green); display: none; }
-  #stopBtn { background: var(--red); color: #2a0a0a; display: none; }
-  .rec-row { display: flex; gap: 10px; }
+  button[data-color="green"] { background: var(--green); color: #10251a; }
+  button[data-color="light-green"] { background: var(--light-green); color: #10251a; }
+  button[data-color="red"] { background: var(--red); color: #fff; }
+  button[data-color="light-red"] { background: var(--light-red); color: #2a0a0a; }
+  button[data-color="blue"] { background: var(--blue); color: #fff; }
+  button[data-color="slate"] { background: var(--slate); color: #fff; }
+  button[data-color="amber"] { background: var(--amber); color: #2a2205; }
+  button[data-color="purple"] { background: var(--purple); color: #fff; }
+  button[data-color="teal"] { background: var(--teal); color: #06282a; }
+  button[data-color="indigo"] { background: var(--indigo); color: #fff; }
+  button[data-color="sky"] { background: var(--sky); color: #052030; }
+
+  /* fade transition helper — JS toggles display + .visible together */
+  .fade { opacity: 0; transition: opacity 200ms ease; }
+  .fade.visible { opacity: 1; }
+
+  #recordBtn { font-size: 1.1rem; padding: 18px; }
+  .rec-row { display: none; gap: 10px; }
   .rec-row button { margin-top: 0; }
+  #pauseBtn, #resumeBtn { display: none; }
 
   #status { color: #888; font-size: 0.9rem; margin-top: 10px; min-height: 1.2em; }
-  #timer { font-variant-numeric: tabular-nums; color: #ef4444; font-weight: 600; display: none; margin-top: 8px; }
-  #timer.show { display: block; }
+
+  #timer { display: none; align-items: center; gap: 8px; margin-top: 8px; }
+  #timer.show { display: flex; }
+  #timerText { font-variant-numeric: tabular-nums; color: #ef4444; font-weight: 600; }
+  .rec-dot { display: none; width: 10px; height: 10px; border-radius: 50%; background: #ef4444; animation: pulse 1s infinite; }
+  .rec-dot.on { display: block; }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
+
+  #modelProgressWrap { margin-top: 8px; display: none; }
+  #modelProgressBar { background: #222; border-radius: 6px; height: 8px; overflow: hidden; }
+  #modelProgressFill { background: var(--green); height: 100%; width: 0%; transition: width 150ms ease; }
+
+  #retryBtn { display: none; }
+  #audioPlayer { width: 100%; margin-top: 10px; display: none; }
 
   .mode-toggle { display: flex; gap: 8px; margin-top: 4px; }
-  .mode-toggle button {
-    margin-top: 0; flex: 1; background: #2a2a2a; color: #999; font-size: 0.85rem; padding: 10px;
-  }
-  .mode-toggle button.active { background: #333; color: #4ade80; border: 1px solid #4ade80; }
+  .mode-toggle button { margin-top: 0; flex: 1; font-size: 0.85rem; padding: 10px; opacity: 0.55; }
+  .mode-toggle button.active { opacity: 1; box-shadow: 0 0 0 2px #fff inset; }
 
   label { display: block; color: #888; font-size: 0.85rem; margin: 20px 0 6px; }
-  textarea {
+  textarea, input[type="text"] {
     width: 100%; background: #111; color: #eee; border: 1px solid #333;
     border-radius: 8px; padding: 10px; font: inherit; font-size: 0.95rem;
-    min-height: 100px; resize: vertical;
   }
+  textarea { min-height: 100px; resize: vertical; }
+  #summary { min-height: 150px; }
 
+  #numbersSection { display: none; }
   .numbers-group { margin-bottom: 12px; }
   .numbers-group h3 { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.03em; margin: 0 0 6px; }
   .numbers-group.confirmed h3 { color: #4ade80; }
   .numbers-group.unverified h3 { color: #f5a524; }
   .numbers-list { display: flex; flex-wrap: wrap; gap: 6px; }
-  .num-chip {
-    background: #222; border-radius: 6px; padding: 4px 10px; font-size: 0.95rem;
-    font-variant-numeric: tabular-nums;
-  }
+  .num-chip { background: #222; border-radius: 6px; padding: 4px 10px; font-size: 0.95rem; font-variant-numeric: tabular-nums; }
   .numbers-group.confirmed .num-chip { border-left: 3px solid #4ade80; }
   .numbers-group.unverified .num-chip { border-left: 3px solid #f5a524; }
 
   .row { display: flex; gap: 10px; }
   .row button { margin-top: 0; }
 
-  #historyPanel {
-    display: none; margin-top: 16px; border-top: 1px solid #333; padding-top: 12px;
-  }
+  #photoInput { display: none; }
+  #photoPreview { display: none; position: relative; margin-top: 10px; }
+  #photoImg { width: 100%; border-radius: 8px; display: block; }
+  #removePhotoBtn { position: absolute; top: 8px; right: 8px; width: auto; padding: 6px 12px; margin-top: 0; }
+
+  #historyPanel { display: none; margin-top: 16px; border-top: 1px solid #333; padding-top: 12px; }
   #historyPanel.show { display: block; }
   .history-actions { display: flex; gap: 8px; margin-bottom: 12px; }
   .history-actions button { margin-top: 0; font-size: 0.85rem; padding: 10px; }
+  #historySearch { margin-bottom: 12px; }
   .history-item {
     display: flex; justify-content: space-between; align-items: center;
-    background: #222; border-radius: 8px; padding: 10px 12px; margin-bottom: 8px;
-    cursor: pointer;
+    background: #222; border-radius: 8px; padding: 10px 12px; margin-bottom: 8px; cursor: pointer;
   }
   .history-item:active { background: #2a2a2a; }
   .history-item .meta { flex: 1; overflow: hidden; }
-  .history-item .date { font-size: 0.75rem; color: #888; }
-  .history-item .preview { font-size: 0.9rem; color: #ddd; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .history-item .del { color: #ef4444; font-weight: 700; padding: 4px 10px; margin-left: 8px; }
+  .history-item .title { font-size: 0.9rem; font-weight: 600; color: #eee; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .history-item .date { font-size: 0.75rem; color: #888; margin-top: 2px; }
+  .item-actions { display: flex; align-items: center; gap: 2px; flex-shrink: 0; }
+  .item-actions span { padding: 6px 8px; font-weight: 700; cursor: pointer; }
+  .item-share { color: var(--blue); font-size: 1.05rem; }
+  .item-del { color: #ef4444; }
   #emptyHistory { color: #666; font-size: 0.9rem; }
   #importFile { display: none; }
+
+  #helpOverlay {
+    display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.7);
+    z-index: 50; align-items: center; justify-content: center; padding: 20px;
+  }
+  #helpOverlay.show { display: flex; }
+  .help-card { background: #1f1f1f; border-radius: 12px; padding: 20px; max-width: 480px; max-height: 80vh; overflow-y: auto; }
+  .help-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+  .help-header h2 { margin: 0; font-size: 1rem; color: #eee; }
+  .help-card ul { margin: 0; padding-left: 18px; color: #ccc; font-size: 0.9rem; line-height: 1.6; }
+  .help-card li { margin-bottom: 8px; }
 </style>
 </head>
 <body>
-  <h1>Voice Note → Text</h1>
+  <div class="header-row">
+    <h1>Voice Note_1 → Text</h1>
+    <button id="helpBtn" class="icon-btn" aria-label="How to use this app">?</button>
+  </div>
 
   <div class="mode-toggle">
-    <button id="modeFast" data-mode="fast">Fast</button>
-    <button id="modeAccurate" data-mode="accurate">Accurate</button>
+    <button id="modeFast" data-mode="fast" data-color="light-red">Fast</button>
+    <button id="modeAccurate" data-mode="accurate" data-color="red">Accurate</button>
   </div>
 
-  <button id="recordBtn">Start Recording</button>
-  <div class="rec-row">
-    <button id="pauseBtn">Pause</button>
-    <button id="resumeBtn">Resume</button>
-    <button id="stopBtn">Stop</button>
+  <button id="recordBtn" class="fade visible" data-color="green">Start Recording</button>
+  <div class="rec-row fade">
+    <button id="pauseBtn" data-color="light-red">Pause</button>
+    <button id="resumeBtn" data-color="light-green">Resume</button>
+    <button id="stopBtn" data-color="red">Stop</button>
   </div>
-  <div id="timer">0:00</div>
-  <div id="status">Tap to record. First use downloads the offline speech model (one time, needs Wi-Fi).</div>
+  <div id="timer">
+    <span id="recDot" class="rec-dot"></span>
+    <span id="timerText">0:00</span>
+  </div>
+  <div id="status"></div>
+  <div id="modelProgressWrap" class="fade">
+    <div id="modelProgressBar"><div id="modelProgressFill"></div></div>
+  </div>
+  <button id="retryBtn" class="fade" data-color="amber">Retry Transcription</button>
+  <audio id="audioPlayer" class="fade" controls></audio>
+
+  <label for="noteTitle">Title (optional)</label>
+  <input type="text" id="noteTitle" placeholder="Auto-filled from transcript if left blank" />
 
   <label for="transcript">Transcript (edit as needed)</label>
   <textarea id="transcript" placeholder="Transcript will appear here..."></textarea>
 
-  <label>Numbers found</label>
-  <div id="numbers">—</div>
+  <div id="numbersSection" class="fade">
+    <label>Numbers found</label>
+    <div id="numbers"></div>
+  </div>
 
   <label for="summary">Message to send</label>
   <textarea id="summary" placeholder="Edit this into the message you want to send..."></textarea>
 
+  <button id="addPhotoBtn" data-color="sky">Add Photo</button>
+  <input type="file" id="photoInput" accept="image/*" capture="environment" />
+  <div id="photoPreview" class="fade">
+    <img id="photoImg" alt="Attached photo" />
+    <button id="removePhotoBtn" data-color="red">✕</button>
+  </div>
+
   <div class="row">
-    <button id="shareBtn" class="secondary">Share</button>
-    <button id="copyBtn" class="secondary">Copy</button>
+    <button id="shareBtn" data-color="blue">Share</button>
+    <button id="copyBtn" data-color="slate">Copy</button>
   </div>
   <div class="row">
-    <button id="saveBtn" class="secondary">Save as .txt</button>
-    <button id="historyBtn" class="secondary">Previous Notes</button>
+    <button id="saveBtn" data-color="amber">Save</button>
+    <button id="historyBtn" data-color="purple">Previous Notes</button>
   </div>
 
   <div id="historyPanel">
     <label style="margin-top:0">Previous notes</label>
     <div class="history-actions">
-      <button id="exportBtn" class="secondary">Export All (JSON)</button>
-      <button id="importBtn" class="secondary">Import</button>
-      <button id="clearAllBtn" class="secondary danger-text">Clear All</button>
+      <button id="exportBtn" data-color="teal">Export All (JSON)</button>
+      <button id="shareBackupBtn" data-color="blue">Share Backup</button>
+      <button id="importBtn" data-color="indigo">Import</button>
+      <button id="clearAllBtn" data-color="red">Clear All</button>
     </div>
     <input type="file" id="importFile" accept="application/json" />
+    <input type="text" id="historySearch" placeholder="Search notes..." />
     <div id="historyList"></div>
+  </div>
+
+  <div id="helpOverlay">
+    <div class="help-card">
+      <div class="help-header">
+        <h2>How to use this app</h2>
+        <button id="closeHelpBtn" class="icon-btn" aria-label="Close">✕</button>
+      </div>
+      <ul>
+        <li><strong>Record:</strong> tap Start. Use Pause/Resume if you need a break, Stop when you're done.</li>
+        <li><strong>Fast vs Accurate:</strong> Fast transcribes quicker but with more mistakes; Accurate is slower but more precise. Pick with the toggle at the top — it's remembered next time, and that model loads quietly in the background so it's usually ready before you need it.</li>
+        <li><strong>Numbers:</strong> after transcribing, numbers said more than once show green ("Confirmed"); numbers said only once show amber ("Verify") — those are the ones worth double-checking.</li>
+        <li><strong>Playback:</strong> use the audio player under the record buttons to listen back to what you actually said, especially for amber numbers.</li>
+        <li><strong>Edit:</strong> fix anything in the title, transcript, or message boxes any time — your changes save automatically as you type.</li>
+        <li><strong>Photo:</strong> tap "Add Photo" to open your camera and attach a picture to this note. Tap the ✕ on the photo to remove it.</li>
+        <li><strong>Share:</strong> sends the message, photo, and original recording (if either is attached) via WhatsApp, Mail, Google Drive, Dropbox, or whatever's installed. Works from the main screen or directly from a note in Previous Notes.</li>
+        <li><strong>Save:</strong> downloads the message as a text file, plus the photo and the original recording if either is attached (recording is only available right after you record it, not for reopened past notes).</li>
+        <li><strong>Previous Notes:</strong> search, browse past notes by date, export your whole history as a backup file, share that backup file (e.g. straight to Drive/Dropbox), import a backup back in, or clear everything.</li>
+      </ul>
+    </div>
   </div>
 
   <script type="module" src="./app.js"></script>

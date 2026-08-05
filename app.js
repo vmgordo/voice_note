@@ -1,17 +1,40 @@
 import { pipeline } from 'https://cdn.jsdelivr.net/npm/@xenova/transformers@2.17.2';
 
+// ============================================================
+// Config
+// ============================================================
 const MODELS = {
   fast: 'Xenova/whisper-tiny.en',
   accurate: 'Xenova/whisper-base.en',
 };
 const HISTORY_KEY = 'voicenote_history';
 const MODE_KEY = 'voicenote_mode';
+const HINT_KEY = 'voicenote_hint_seen';
+const NOTE_COUNTER_KEY = 'voicenote_note_counter';
+const BACKUP_MARKER_KEY = 'voicenote_backup_marker';
 const MAX_HISTORY = 50;
+const HISTORY_UPDATE_DEBOUNCE_MS = 800;
+const BACKUP_REMINDER_THRESHOLD = 20;
 
+// ============================================================
+// Element references
+// ============================================================
 const recordBtn = document.getElementById('recordBtn');
+const recRow = document.querySelector('.rec-row');
+const pauseBtn = document.getElementById('pauseBtn');
+const resumeBtn = document.getElementById('resumeBtn');
+const stopBtn = document.getElementById('stopBtn');
 const statusEl = document.getElementById('status');
 const timerEl = document.getElementById('timer');
+const timerTextEl = document.getElementById('timerText');
+const recDot = document.getElementById('recDot');
+const modelProgressWrap = document.getElementById('modelProgressWrap');
+const modelProgressFill = document.getElementById('modelProgressFill');
+const retryBtn = document.getElementById('retryBtn');
+const audioPlayerEl = document.getElementById('audioPlayer');
+const noteTitleEl = document.getElementById('noteTitle');
 const transcriptEl = document.getElementById('transcript');
+const numbersSection = document.getElementById('numbersSection');
 const numbersEl = document.getElementById('numbers');
 const summaryEl = document.getElementById('summary');
 const shareBtn = document.getElementById('shareBtn');
@@ -19,59 +42,271 @@ const copyBtn = document.getElementById('copyBtn');
 const saveBtn = document.getElementById('saveBtn');
 const historyBtn = document.getElementById('historyBtn');
 const historyPanel = document.getElementById('historyPanel');
+const historySearchEl = document.getElementById('historySearch');
 const historyList = document.getElementById('historyList');
+const backupReminderEl = document.getElementById('backupReminder');
 const modeFastBtn = document.getElementById('modeFast');
 const modeAccurateBtn = document.getElementById('modeAccurate');
+const exportBtn = document.getElementById('exportBtn');
+const shareBackupBtn = document.getElementById('shareBackupBtn');
+const importBtn = document.getElementById('importBtn');
+const importFile = document.getElementById('importFile');
+const clearAllBtn = document.getElementById('clearAllBtn');
+const addPhotoBtn = document.getElementById('addPhotoBtn');
+const photoInput = document.getElementById('photoInput');
+const photoPreview = document.getElementById('photoPreview');
+const photoImg = document.getElementById('photoImg');
+const removePhotoBtn = document.getElementById('removePhotoBtn');
+const addVideoBtn = document.getElementById('addVideoBtn');
+const videoInput = document.getElementById('videoInput');
+const videoPreview = document.getElementById('videoPreview');
+const videoPreviewEl = document.getElementById('videoPreviewEl');
+const removeVideoBtn = document.getElementById('removeVideoBtn');
+const helpBtn = document.getElementById('helpBtn');
+const closeHelpBtn = document.getElementById('closeHelpBtn');
+const helpOverlay = document.getElementById('helpOverlay');
 
+// ============================================================
+// State
+// ============================================================
 let mediaRecorder = null;
 let chunks = [];
-let recording = false;
-let recordStart = null;
-let timerInterval = null;
+let recState = 'idle'; // 'idle' | 'recording' | 'paused'
 let recordMimeType = '';
-const transcribers = {}; // cached per mode: { fast: pipelineInstance, accurate: pipelineInstance }
 let mode = localStorage.getItem(MODE_KEY) || 'accurate';
 
-// --- Service worker for offline app shell ---
+let elapsedBeforePause = 0;
+let segmentStart = null;
+let timerInterval = null;
+
+let wakeLock = null;
+
+let photoBlob = null;
+let currentPhotoDataUrl = null; // compressed version, persisted to history
+
+let videoBlob = null;
+let videoUrl = null; // in-memory only — never persisted, too large for localStorage
+
+let lastRecordingBlob = null;
+let lastRecordingUrl = null; // in-memory only — never persisted
+
+let currentHistoryId = null;
+let historyUpdateTimer = null;
+
+let fileShareUnreliable = false; // set once canShare() proves untrustworthy on this browser this session
+
+// ============================================================
+// Small helpers
+// ============================================================
+function show(el, displayType = 'block') {
+  el.style.display = displayType;
+  requestAnimationFrame(() => el.classList.add('visible'));
+}
+function hide(el) {
+  el.classList.remove('visible');
+  setTimeout(() => { el.style.display = 'none'; }, 200);
+}
+function safeSet(key, value) {
+  try {
+    localStorage.setItem(key, value);
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+function timestamp() {
+  return new Date().toISOString().slice(0, 16).replace('T', '-').replace(':', '');
+}
+function downloadBlob(filename, blob) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+function downloadFile(filename, content, mimeType) {
+  downloadBlob(filename, new Blob([content], { type: mimeType }));
+}
+function escapeHtml(str) {
+  const d = document.createElement('div');
+  d.textContent = str;
+  return d.innerHTML;
+}
+
+// ============================================================
+// Service worker (offline app shell)
+// ============================================================
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('./sw.js').catch(() => {});
 }
 
-// --- Mode toggle (persisted) ---
+// ============================================================
+// Help modal
+// ============================================================
+helpBtn.addEventListener('click', () => helpOverlay.classList.add('show'));
+closeHelpBtn.addEventListener('click', () => helpOverlay.classList.remove('show'));
+helpOverlay.addEventListener('click', (e) => {
+  if (e.target === helpOverlay) helpOverlay.classList.remove('show');
+});
+
+// ============================================================
+// One-time hint
+// ============================================================
+if (!localStorage.getItem(HINT_KEY)) {
+  statusEl.textContent = 'Tap to record. First use downloads the offline speech model (one time, needs Wi-Fi).';
+}
+
+// ============================================================
+// Model loading — preload/warm in background, WebGPU with WASM fallback
+// ============================================================
+const transcriberPromises = {};
+
+function makeProgressHandler() {
+  return (p) => {
+    if (p.status === 'progress') {
+      modelProgressFill.classList.remove('indeterminate');
+      show(modelProgressWrap);
+      modelProgressFill.style.width = Math.round(p.progress) + '%';
+    }
+  };
+}
+
+async function loadTranscriber(m) {
+  const modelId = MODELS[m];
+  const progressCb = makeProgressHandler();
+  if (typeof navigator !== 'undefined' && navigator.gpu) {
+    try {
+      return await pipeline('automatic-speech-recognition', modelId, {
+        quantized: true,
+        device: 'webgpu',
+        progress_callback: progressCb,
+      });
+    } catch (e) {
+      // WebGPU unavailable or failed for this model — fall through to WASM
+    }
+  }
+  return await pipeline('automatic-speech-recognition', modelId, {
+    quantized: true,
+    progress_callback: progressCb,
+  });
+}
+
+function ensureTranscriber(m) {
+  if (!transcriberPromises[m]) {
+    transcriberPromises[m] = loadTranscriber(m)
+      .then((t) => { hideProgress(); return t; })
+      .catch((err) => { delete transcriberPromises[m]; throw err; });
+  }
+  return transcriberPromises[m];
+}
+
+// non-percentage steps (decoding, transcribing) — animated bar, no real % available
+function showIndeterminateProgress() {
+  modelProgressFill.classList.add('indeterminate');
+  modelProgressFill.style.width = '';
+  show(modelProgressWrap);
+}
+function hideProgress() {
+  modelProgressFill.classList.remove('indeterminate');
+  hide(modelProgressWrap);
+}
+
+// ============================================================
+// Mode toggle
+// ============================================================
 function setMode(newMode) {
   mode = newMode;
-  localStorage.setItem(MODE_KEY, mode);
+  safeSet(MODE_KEY, mode);
   modeFastBtn.classList.toggle('active', mode === 'fast');
   modeAccurateBtn.classList.toggle('active', mode === 'accurate');
+  ensureTranscriber(mode).catch(() => {}); // warm up in the background
 }
 modeFastBtn.addEventListener('click', () => setMode('fast'));
 modeAccurateBtn.addEventListener('click', () => setMode('accurate'));
-setMode(mode);
+setMode(mode); // also triggers the initial background model warm-up
 
-// --- Recording ---
-function pickMimeType() {
-  const candidates = [
-    'audio/mp4', // Safari/iOS
-    'audio/webm;codecs=opus',
-    'audio/webm',
-    'audio/ogg;codecs=opus',
-  ];
-  for (const type of candidates) {
-    if (window.MediaRecorder && MediaRecorder.isTypeSupported(type)) return type;
-  }
-  return ''; // let the browser choose
+// ============================================================
+// Wake Lock
+// ============================================================
+async function acquireWakeLock() {
+  if (!('wakeLock' in navigator)) return;
+  try {
+    wakeLock = await navigator.wakeLock.request('screen');
+    wakeLock.addEventListener('release', () => { wakeLock = null; });
+  } catch (e) {}
 }
-
-recordBtn.addEventListener('click', async () => {
-  if (!recording) {
-    await startRecording();
-  } else {
-    stopRecording();
+async function releaseWakeLock() {
+  if (wakeLock) {
+    try { await wakeLock.release(); } catch (e) {}
+    wakeLock = null;
+  }
+}
+document.addEventListener('visibilitychange', async () => {
+  if (document.visibilityState === 'visible' && recState !== 'idle' && !wakeLock) {
+    await acquireWakeLock();
   }
 });
 
+// ============================================================
+// Recording controls
+// ============================================================
+function pickMimeType() {
+  const candidates = ['audio/mp4', 'audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus'];
+  for (const type of candidates) {
+    if (window.MediaRecorder && MediaRecorder.isTypeSupported(type)) return type;
+  }
+  return '';
+}
+
+function showRecordingUI() {
+  hide(recordBtn);
+  show(recRow, 'flex');
+  pauseBtn.style.display = recState === 'recording' ? 'block' : 'none';
+  resumeBtn.style.display = recState === 'paused' ? 'block' : 'none';
+  recDot.classList.toggle('on', recState === 'recording');
+  timerEl.classList.add('show');
+}
+function showIdleUI() {
+  hide(recRow);
+  show(recordBtn);
+  recDot.classList.remove('on');
+  timerEl.classList.remove('show');
+}
+showIdleUI();
+
+recordBtn.addEventListener('click', startRecording);
+pauseBtn.addEventListener('click', pauseRecording);
+resumeBtn.addEventListener('click', resumeRecording);
+stopBtn.addEventListener('click', stopRecording);
+
 async function startRecording() {
-  const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  statusEl.textContent = 'Requesting microphone access...';
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  } catch (err) {
+    statusEl.textContent = 'Microphone access denied or unavailable. Check your browser/site permissions and try again.';
+    return;
+  }
+
+  safeSet(HINT_KEY, '1');
+
+  // clear the screen for a fresh note
+  noteTitleEl.value = '';
+  transcriptEl.value = '';
+  summaryEl.value = '';
+  hide(numbersSection);
+  numbersEl.innerHTML = '';
+  clearPhoto();
+  clearVideo();
+  hideAudioPlayback();
+  hide(retryBtn);
+  lastRecordingBlob = null;
+  currentHistoryId = null;
+
   chunks = [];
   recordMimeType = pickMimeType();
   mediaRecorder = recordMimeType
@@ -80,75 +315,155 @@ async function startRecording() {
   mediaRecorder.ondataavailable = (e) => chunks.push(e.data);
   mediaRecorder.onstop = onRecordingStopped;
   mediaRecorder.start();
-  recording = true;
-  recordBtn.textContent = 'Stop Recording';
-  recordBtn.classList.add('recording');
+
+  // Safety net: if the OS reclaims the mic for another app (phone call, or
+  // opening the camera without going through stopRecordingForCamera below),
+  // the browser auto-stops the recorder per spec — this keeps our own UI
+  // state from getting stuck out of sync when that happens.
+  stream.getAudioTracks().forEach((track) => {
+    track.addEventListener('ended', () => {
+      if (recState !== 'idle') {
+        clearInterval(timerInterval);
+        recState = 'idle';
+        showIdleUI();
+        releaseWakeLock();
+      }
+    });
+  });
+
+  recState = 'recording';
+  showRecordingUI();
   statusEl.textContent = 'Recording...';
 
-  recordStart = Date.now();
-  timerEl.classList.add('show');
+  elapsedBeforePause = 0;
+  segmentStart = Date.now();
   updateTimer();
   timerInterval = setInterval(updateTimer, 1000);
+
+  await acquireWakeLock();
+}
+
+function pauseRecording() {
+  if (recState !== 'recording') return;
+  mediaRecorder.pause();
+  clearInterval(timerInterval);
+  elapsedBeforePause += Math.floor((Date.now() - segmentStart) / 1000);
+  recState = 'paused';
+  showRecordingUI();
+  statusEl.textContent = 'Paused.';
+}
+
+function resumeRecording() {
+  if (recState !== 'paused') return;
+  mediaRecorder.resume();
+  segmentStart = Date.now();
+  timerInterval = setInterval(updateTimer, 1000);
+  recState = 'recording';
+  showRecordingUI();
+  statusEl.textContent = 'Recording...';
 }
 
 function updateTimer() {
-  const secs = Math.floor((Date.now() - recordStart) / 1000);
+  const running = recState === 'recording' ? Math.floor((Date.now() - segmentStart) / 1000) : 0;
+  const secs = elapsedBeforePause + running;
   const m = Math.floor(secs / 60);
   const s = String(secs % 60).padStart(2, '0');
-  timerEl.textContent = `${m}:${s}`;
+  timerTextEl.textContent = `${m}:${s}`;
 }
 
 function stopRecording() {
+  if (recState === 'idle') return;
   mediaRecorder.stop();
   mediaRecorder.stream.getTracks().forEach((t) => t.stop());
-  recording = false;
-  recordBtn.textContent = 'Start Recording';
-  recordBtn.classList.remove('recording');
   clearInterval(timerInterval);
-  timerEl.classList.remove('show');
+  recState = 'idle';
+  showIdleUI();
+  releaseWakeLock();
+}
+
+// Used by Add Photo / Add Video — opening the camera takes the mic away
+// from us regardless, so we stop on purpose (finalizing the note) instead
+// of letting that happen as an uncontrolled interruption.
+function stopRecordingForCamera(whatFor) {
+  if (recState === 'idle') return;
+  stopRecording();
+  statusEl.textContent = `Recording stopped to open the camera for ${whatFor} — your note is being saved.`;
 }
 
 async function onRecordingStopped() {
   const blob = new Blob(chunks, { type: recordMimeType || 'audio/webm' });
+  lastRecordingBlob = blob;
+  showAudioPlayback(blob);
   await transcribe(blob);
 }
 
-// --- Transcription (on-device, mode-selectable) ---
+// ============================================================
+// Playback (in-memory only)
+// ============================================================
+function showAudioPlayback(blob) {
+  if (lastRecordingUrl) URL.revokeObjectURL(lastRecordingUrl);
+  lastRecordingUrl = URL.createObjectURL(blob);
+  audioPlayerEl.src = lastRecordingUrl;
+  show(audioPlayerEl);
+}
+function hideAudioPlayback() {
+  if (lastRecordingUrl) {
+    URL.revokeObjectURL(lastRecordingUrl);
+    lastRecordingUrl = null;
+  }
+  audioPlayerEl.removeAttribute('src');
+  hide(audioPlayerEl);
+}
+
+// ============================================================
+// Transcription + retry
+// ============================================================
+retryBtn.addEventListener('click', () => {
+  if (lastRecordingBlob) transcribe(lastRecordingBlob);
+});
+
+function dateHourLabel(date) {
+  return date.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric' });
+}
+function suggestTitle(text) {
+  const words = text.trim().split(/\s+/).slice(0, 6).join(' ');
+  const snippet = words.length > 40 ? words.slice(0, 40) + '…' : words;
+  const label = dateHourLabel(new Date());
+  return snippet ? `${label} — ${snippet}` : label;
+}
+
 async function transcribe(blob) {
   recordBtn.disabled = true;
   modeFastBtn.disabled = true;
   modeAccurateBtn.disabled = true;
+  hide(retryBtn);
   try {
-    statusEl.textContent = 'Loading speech model (first time only)...';
-    if (!transcribers[mode]) {
-      transcribers[mode] = await pipeline('automatic-speech-recognition', MODELS[mode], {
-        quantized: true,
-        progress_callback: (p) => {
-          if (p.status === 'progress') {
-            statusEl.textContent = `Downloading model: ${Math.round(p.progress)}%`;
-          }
-        },
-      });
-    }
+    statusEl.textContent = 'Loading speech model...';
+    const transcriber = await ensureTranscriber(mode);
 
     statusEl.textContent = 'Decoding audio...';
+    showIndeterminateProgress();
     const audioData = await decodeToMono16k(blob);
 
     statusEl.textContent = 'Transcribing...';
-    // stride_length_s overlaps chunk boundaries so words aren't cut off
-    // at the 30s mark; the library stitches the overlap back together.
-    const result = await transcribers[mode](audioData, { chunk_length_s: 30, stride_length_s: 5 });
+    const result = await transcriber(audioData, { chunk_length_s: 30, stride_length_s: 5 });
+    hideProgress();
 
     const text = result.text.trim();
     transcriptEl.value = text;
     renderNumbers(text);
     summaryEl.value = text;
-    statusEl.textContent = 'Done. Edit below, then share or save.';
+    if (!noteTitleEl.value.trim()) noteTitleEl.value = suggestTitle(text);
 
-    // auto-save immediately so nothing is lost if the tab closes
-    saveToHistory(text, text);
+    const { ok, id } = saveToHistory(text, text, currentPhotoDataUrl, noteTitleEl.value);
+    currentHistoryId = id;
+    statusEl.textContent = ok
+      ? 'Done. Edit below, then share or save.'
+      : 'Done — but saving to history failed (storage may be full). Use Save to keep this note.';
   } catch (err) {
-    statusEl.textContent = 'Error: ' + err.message;
+    hideProgress();
+    statusEl.textContent = 'Error: ' + err.message + ' — you can retry using the recording below.';
+    show(retryBtn);
   } finally {
     recordBtn.disabled = false;
     modeFastBtn.disabled = false;
@@ -168,22 +483,21 @@ async function decodeToMono16k(blob) {
   return mono;
 }
 
-// --- Number extraction with majority-vote confidence, formatted for legibility ---
+// ============================================================
+// Number extraction — majority-vote confidence
+// ============================================================
 function renderNumbers(text) {
   const matches = text.match(/\d+(\.\d+)?/g) || [];
   if (matches.length === 0) {
-    numbersEl.innerHTML = '<span style="color:#666">No numbers found.</span>';
+    hide(numbersSection);
+    numbersEl.innerHTML = '';
     return;
   }
   const freq = {};
   matches.forEach((n) => (freq[n] = (freq[n] || 0) + 1));
 
-  const confirmed = Object.keys(freq)
-    .filter((n) => freq[n] > 1)
-    .sort((a, b) => Number(a) - Number(b));
-  const unverified = Object.keys(freq)
-    .filter((n) => freq[n] === 1)
-    .sort((a, b) => Number(a) - Number(b));
+  const confirmed = Object.keys(freq).filter((n) => freq[n] > 1).sort((a, b) => Number(a) - Number(b));
+  const unverified = Object.keys(freq).filter((n) => freq[n] === 1).sort((a, b) => Number(a) - Number(b));
 
   let html = '';
   if (confirmed.length) {
@@ -197,21 +511,208 @@ function renderNumbers(text) {
     html += `</div></div>`;
   }
   numbersEl.innerHTML = html;
+  show(numbersSection);
 }
 
-// --- Share / Copy ---
-shareBtn.addEventListener('click', async () => {
-  const text = summaryEl.value;
+// ============================================================
+// Live edits (message/title only — transcript is read-only)
+// ============================================================
+summaryEl.addEventListener('input', scheduleHistoryUpdate);
+noteTitleEl.addEventListener('input', scheduleHistoryUpdate);
+
+function scheduleHistoryUpdate() {
+  clearTimeout(historyUpdateTimer);
+  historyUpdateTimer = setTimeout(updateCurrentHistoryEntry, HISTORY_UPDATE_DEBOUNCE_MS);
+}
+function updateCurrentHistoryEntry() {
+  if (!currentHistoryId) return;
+  const history = loadHistory();
+  const idx = history.findIndex((h) => h.id === currentHistoryId);
+  if (idx === -1) return;
+  history[idx].transcript = transcriptEl.value;
+  history[idx].summary = summaryEl.value;
+  history[idx].title = noteTitleEl.value;
+  history[idx].photo = currentPhotoDataUrl;
+  safeSet(HISTORY_KEY, JSON.stringify(history));
+  if (historyPanel.classList.contains('show')) renderHistory();
+}
+
+// ============================================================
+// Photo
+// ============================================================
+addPhotoBtn.addEventListener('click', () => {
+  stopRecordingForCamera('the photo');
+  photoInput.click();
+});
+
+photoInput.addEventListener('change', async () => {
+  const file = photoInput.files[0];
+  if (!file) return;
+  photoBlob = file;
+  photoImg.src = URL.createObjectURL(file);
+  show(photoPreview);
+  try {
+    currentPhotoDataUrl = await compressPhoto(file);
+  } catch (e) {
+    currentPhotoDataUrl = null;
+  }
+  updateCurrentHistoryEntry();
+});
+
+removePhotoBtn.addEventListener('click', () => {
+  clearPhoto();
+  updateCurrentHistoryEntry();
+});
+
+function clearPhoto() {
+  photoBlob = null;
+  photoInput.value = '';
+  hide(photoPreview);
+  currentPhotoDataUrl = null;
+}
+
+function compressPhoto(blob) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    const objectUrl = URL.createObjectURL(blob);
+    img.onload = () => {
+      const maxW = 640;
+      const scale = Math.min(1, maxW / img.width);
+      const w = Math.round(img.width * scale);
+      const h = Math.round(img.height * scale);
+      const canvas = document.createElement('canvas');
+      canvas.width = w;
+      canvas.height = h;
+      canvas.getContext('2d').drawImage(img, 0, 0, w, h);
+      URL.revokeObjectURL(objectUrl);
+      resolve(canvas.toDataURL('image/jpeg', 0.6));
+    };
+    img.onerror = () => {
+      URL.revokeObjectURL(objectUrl);
+      reject(new Error('Could not process photo.'));
+    };
+    img.src = objectUrl;
+  });
+}
+
+function dataURLtoBlob(dataUrl) {
+  const [header, base64] = dataUrl.split(',');
+  const mime = (header.match(/data:(.*?);base64/) || [])[1] || 'image/jpeg';
+  const binary = atob(base64);
+  const arr = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) arr[i] = binary.charCodeAt(i);
+  return new Blob([arr], { type: mime });
+}
+
+// ============================================================
+// Video — in-memory only, never persisted to history (too large)
+// ============================================================
+addVideoBtn.addEventListener('click', () => {
+  stopRecordingForCamera('the video');
+  videoInput.click();
+});
+
+videoInput.addEventListener('change', () => {
+  const file = videoInput.files[0];
+  if (!file) return;
+  videoBlob = file;
+  if (videoUrl) URL.revokeObjectURL(videoUrl);
+  videoUrl = URL.createObjectURL(file);
+  videoPreviewEl.src = videoUrl;
+  show(videoPreview);
+});
+
+removeVideoBtn.addEventListener('click', clearVideo);
+
+function clearVideo() {
+  videoBlob = null;
+  videoInput.value = '';
+  if (videoUrl) { URL.revokeObjectURL(videoUrl); videoUrl = null; }
+  videoPreviewEl.removeAttribute('src');
+  hide(videoPreview);
+}
+
+function extForVideoMime(mime) {
+  if (!mime) return 'mp4';
+  if (mime.includes('webm')) return 'webm';
+  if (mime.includes('quicktime')) return 'mov';
+  return 'mp4';
+}
+function extForAudioMime(mime) {
+  if (!mime) return 'webm';
+  if (mime.includes('mp4')) return 'm4a';
+  if (mime.includes('ogg')) return 'ogg';
+  return 'webm';
+}
+
+// ============================================================
+// Share — single-call-per-tap safe, learns from unreliable canShare()
+// ============================================================
+async function shareText(text, files) {
   if (navigator.share) {
+    // The Web Share API allows exactly ONE navigator.share() call per user
+    // gesture — a second call after the first fails (even synchronously)
+    // throws "must be handling a user gesture". So the decision of whether
+    // to include files must be made up front via canShare() (which does
+    // NOT consume activation), and only one share() call is ever made.
+    const includeFiles = !!(
+      files && files.length && !fileShareUnreliable &&
+      navigator.canShare && navigator.canShare({ text, files })
+    );
     try {
-      await navigator.share({ text });
+      if (includeFiles) {
+        await navigator.share({ text, files });
+        return 'shared';
+      } else {
+        await navigator.share({ text });
+        return files && files.length ? 'text-only' : 'shared';
+      }
     } catch (e) {
-      /* user cancelled */
+      if (e && e.name === 'AbortError') return 'cancelled';
+      if (includeFiles) {
+        // canShare() said yes but the platform still rejected it — canShare()
+        // can't be trusted on this browser; stop attempting files this session.
+        fileShareUnreliable = true;
+        return 'file-share-unreliable';
+      }
+      return 'error:' + (e && e.message ? e.message : 'Share failed.');
     }
   } else {
-    await navigator.clipboard.writeText(text);
-    statusEl.textContent = 'Sharing not supported here — copied to clipboard instead.';
+    try {
+      await navigator.clipboard.writeText(text);
+      return 'clipboard';
+    } catch (e) {
+      return 'error:Could not copy to clipboard.';
+    }
   }
+}
+
+function reportShareResult(result) {
+  if (result === 'text-only') {
+    statusEl.textContent = "Shared the text — this browser can't attach the photo/video/audio automatically, so attach them separately.";
+  } else if (result === 'file-share-unreliable') {
+    statusEl.textContent = 'This browser rejected the attachment — sharing text only for the rest of this session. Use Save to keep the photo/video/audio.';
+  } else if (result === 'clipboard') {
+    statusEl.textContent = 'Sharing not supported here — copied to clipboard instead.';
+  } else if (typeof result === 'string' && result.startsWith('error:')) {
+    statusEl.textContent = result.slice(6);
+  }
+  // 'shared' and 'cancelled' need no message.
+}
+
+shareBtn.addEventListener('click', async () => {
+  const files = [];
+  if (photoBlob) files.push(photoBlob);
+  if (videoBlob) {
+    files.push(new File([videoBlob], `voicenote-video.${extForVideoMime(videoBlob.type)}`, { type: videoBlob.type || 'video/mp4' }));
+  }
+  if (lastRecordingBlob) {
+    files.push(new File([lastRecordingBlob], `voicenote-audio.${extForAudioMime(recordMimeType)}`, {
+      type: recordMimeType || 'audio/webm',
+    }));
+  }
+  const result = await shareText(summaryEl.value, files);
+  reportShareResult(result);
 });
 
 copyBtn.addEventListener('click', async () => {
@@ -219,29 +720,26 @@ copyBtn.addEventListener('click', async () => {
   statusEl.textContent = 'Copied to clipboard.';
 });
 
-// --- Save as .txt file ---
+// ============================================================
+// Save
+// ============================================================
 saveBtn.addEventListener('click', () => {
   const content = summaryEl.value || transcriptEl.value;
-  if (!content) {
+  if (!content && !photoBlob && !videoBlob && !lastRecordingBlob) {
     statusEl.textContent = 'Nothing to save yet.';
     return;
   }
-  const now = new Date();
-  const stamp = now.toISOString().slice(0, 16).replace('T', '-').replace(':', '');
-  const filename = `voicenote-${stamp}.txt`;
-  const blob = new Blob([content], { type: 'text/plain' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  URL.revokeObjectURL(url);
-  statusEl.textContent = `Saved ${filename}`;
+  const saved = [];
+  if (content) { downloadFile(`voicenote-${timestamp()}.txt`, content, 'text/plain'); saved.push('text'); }
+  if (photoBlob) { downloadBlob(`voicenote-photo-${timestamp()}.jpg`, photoBlob); saved.push('photo'); }
+  if (videoBlob) { downloadBlob(`voicenote-video-${timestamp()}.${extForVideoMime(videoBlob.type)}`, videoBlob); saved.push('video'); }
+  if (lastRecordingBlob) { downloadBlob(`voicenote-audio-${timestamp()}.${extForAudioMime(recordMimeType)}`, lastRecordingBlob); saved.push('audio'); }
+  statusEl.textContent = `Saved ${saved.join(', ')}.`;
 });
 
-// --- History (localStorage, scrollable by date) ---
+// ============================================================
+// History
+// ============================================================
 function loadHistory() {
   try {
     return JSON.parse(localStorage.getItem(HISTORY_KEY) || '[]');
@@ -250,25 +748,56 @@ function loadHistory() {
   }
 }
 
-function saveToHistory(transcript, summary) {
+function saveToHistory(transcript, summary, photo, title) {
   const history = loadHistory();
-  history.unshift({
-    id: Date.now(),
-    date: new Date().toISOString(),
-    transcript,
-    summary,
-  });
+  const id = Date.now();
+  history.unshift({ id, date: new Date().toISOString(), transcript, summary, photo: photo || null, title: title || '' });
   while (history.length > MAX_HISTORY) history.pop();
-  localStorage.setItem(HISTORY_KEY, JSON.stringify(history));
+  const ok = safeSet(HISTORY_KEY, JSON.stringify(history));
+  incrementNoteCounter();
   if (historyPanel.classList.contains('show')) renderHistory();
+  return { ok, id };
+}
+
+// backup reminder — tracked via a monotonic counter, not history.length,
+// so deleting notes or aging past the 50-note cap doesn't hide the reminder
+function getNoteCounter() { return parseInt(localStorage.getItem(NOTE_COUNTER_KEY) || '0', 10); }
+function incrementNoteCounter() { safeSet(NOTE_COUNTER_KEY, String(getNoteCounter() + 1)); }
+function getBackupMarker() { return parseInt(localStorage.getItem(BACKUP_MARKER_KEY) || '0', 10); }
+function markBackedUp() { safeSet(BACKUP_MARKER_KEY, String(getNoteCounter())); updateBackupReminder(); }
+
+function updateBackupReminder() {
+  const since = getNoteCounter() - getBackupMarker();
+  if (since < BACKUP_REMINDER_THRESHOLD) {
+    hide(backupReminderEl);
+    return;
+  }
+  backupReminderEl.innerHTML = `<p>${since} new notes since your last backup — want to back them up?</p>`;
+  const btn = document.createElement('button');
+  btn.textContent = 'Share Backup';
+  btn.setAttribute('data-color', 'blue');
+  btn.addEventListener('click', () => shareBackupBtn.click());
+  backupReminderEl.appendChild(btn);
+  show(backupReminderEl);
 }
 
 function renderHistory() {
-  const history = loadHistory();
+  updateBackupReminder();
+  const query = historySearchEl.value.trim().toLowerCase();
+  let history = loadHistory();
+  if (query) {
+    history = history.filter((h) =>
+      (h.title || '').toLowerCase().includes(query) ||
+      (h.summary || '').toLowerCase().includes(query) ||
+      (h.transcript || '').toLowerCase().includes(query)
+    );
+  }
+
   if (history.length === 0) {
-    historyList.innerHTML = '<div id="emptyHistory">No previous notes yet.</div>';
+    historyList.innerHTML = `<div id="emptyHistory">${query ? 'No notes match your search.' : 'No previous notes yet.'}</div>`;
     return;
   }
+
   historyList.innerHTML = '';
   history.forEach((item) => {
     const div = document.createElement('div');
@@ -279,38 +808,143 @@ function renderHistory() {
     const dateStr = new Date(item.date).toLocaleString(undefined, {
       month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
     });
-    meta.innerHTML = `<div class="date">${dateStr}</div><div class="preview">${escapeHtml(item.summary.slice(0, 60))}</div>`;
-    meta.addEventListener('click', () => {
-      transcriptEl.value = item.transcript;
-      summaryEl.value = item.summary;
-      renderNumbers(item.transcript);
-      statusEl.textContent = `Loaded note from ${dateStr}`;
-      historyPanel.classList.remove('show');
+    const primary = item.title ? item.title : (item.summary || '').slice(0, 60);
+    meta.innerHTML = `<div class="title">${escapeHtml(primary)}</div><div class="date">${dateStr}${item.photo ? ' · 📷' : ''}</div>`;
+    meta.addEventListener('click', () => loadHistoryItem(item, dateStr));
+
+    const actions = document.createElement('div');
+    actions.className = 'item-actions';
+
+    const shareSpan = document.createElement('span');
+    shareSpan.className = 'item-share';
+    shareSpan.textContent = '📤';
+    shareSpan.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const files = item.photo ? [new File([dataURLtoBlob(item.photo)], 'photo.jpg', { type: 'image/jpeg' })] : [];
+      const result = await shareText(item.summary, files);
+      reportShareResult(result);
     });
 
     const del = document.createElement('span');
-    del.className = 'del';
+    del.className = 'item-del';
     del.textContent = '✕';
     del.addEventListener('click', (e) => {
       e.stopPropagation();
+      if (!confirm('Delete this note?')) return;
       const remaining = loadHistory().filter((h) => h.id !== item.id);
-      localStorage.setItem(HISTORY_KEY, JSON.stringify(remaining));
+      safeSet(HISTORY_KEY, JSON.stringify(remaining));
       renderHistory();
     });
 
+    actions.appendChild(shareSpan);
+    actions.appendChild(del);
     div.appendChild(meta);
-    div.appendChild(del);
+    div.appendChild(actions);
     historyList.appendChild(div);
   });
 }
 
-function escapeHtml(str) {
-  const d = document.createElement('div');
-  d.textContent = str;
-  return d.innerHTML;
+function loadHistoryItem(item, dateStr) {
+  noteTitleEl.value = item.title || '';
+  transcriptEl.value = item.transcript;
+  summaryEl.value = item.summary;
+  renderNumbers(item.transcript);
+  hideAudioPlayback(); // no audio saved with history entries
+  clearVideo(); // no video saved with history entries either
+  hide(retryBtn);
+  lastRecordingBlob = null;
+  currentHistoryId = item.id; // further edits update this same entry
+
+  if (item.photo) {
+    photoBlob = dataURLtoBlob(item.photo);
+    photoImg.src = item.photo;
+    show(photoPreview);
+    currentPhotoDataUrl = item.photo;
+  } else {
+    clearPhoto();
+  }
+
+  statusEl.textContent = `Loaded note from ${dateStr}`;
+  historyPanel.classList.remove('show');
 }
 
 historyBtn.addEventListener('click', () => {
   historyPanel.classList.toggle('show');
   if (historyPanel.classList.contains('show')) renderHistory();
+});
+historySearchEl.addEventListener('input', renderHistory);
+
+// ============================================================
+// Export / Share Backup / Import / Clear all
+// ============================================================
+exportBtn.addEventListener('click', () => {
+  const history = loadHistory();
+  if (history.length === 0) {
+    statusEl.textContent = 'No history to export.';
+    return;
+  }
+  downloadFile(`voicenote-history-${timestamp()}.json`, JSON.stringify(history, null, 2), 'application/json');
+  markBackedUp();
+  statusEl.textContent = `Exported ${history.length} note(s).`;
+});
+
+shareBackupBtn.addEventListener('click', async () => {
+  const history = loadHistory();
+  if (history.length === 0) {
+    statusEl.textContent = 'No history to share.';
+    return;
+  }
+  const file = new File(
+    [JSON.stringify(history, null, 2)],
+    `voicenote-history-${timestamp()}.json`,
+    { type: 'application/json' }
+  );
+  const result = await shareText(`Voice Note history backup — ${history.length} note(s)`, [file]);
+  if (result === 'shared') {
+    markBackedUp();
+    statusEl.textContent = 'Backup shared.';
+  } else if (result === 'text-only' || result === 'file-share-unreliable') {
+    statusEl.textContent = "This browser can't share the backup file directly — use Export All to download it instead.";
+  } else if (result === 'clipboard') {
+    statusEl.textContent = 'Sharing not supported here — use Export All to download instead.';
+  } else if (typeof result === 'string' && result.startsWith('error:')) {
+    statusEl.textContent = result.slice(6);
+  }
+});
+
+importBtn.addEventListener('click', () => importFile.click());
+
+importFile.addEventListener('change', async () => {
+  const file = importFile.files[0];
+  if (!file) return;
+  try {
+    const text = await file.text();
+    const imported = JSON.parse(text);
+    if (!Array.isArray(imported)) throw new Error('File is not a valid history export.');
+
+    const existing = loadHistory();
+    const byId = new Map(existing.map((h) => [h.id, h]));
+    imported.forEach((h) => {
+      if (h && h.id && h.date && typeof h.summary === 'string') byId.set(h.id, h);
+    });
+    const merged = Array.from(byId.values()).sort((a, b) => new Date(b.date) - new Date(a.date));
+    const trimmed = merged.slice(0, MAX_HISTORY);
+
+    const ok = safeSet(HISTORY_KEY, JSON.stringify(trimmed));
+    statusEl.textContent = ok
+      ? `Imported. History now has ${trimmed.length} note(s).`
+      : 'Import failed to save — storage may be full.';
+    renderHistory();
+  } catch (err) {
+    statusEl.textContent = 'Import failed: ' + err.message;
+  } finally {
+    importFile.value = '';
+  }
+});
+
+clearAllBtn.addEventListener('click', () => {
+  if (!confirm('Delete all saved notes? This cannot be undone.')) return;
+  safeSet(HISTORY_KEY, JSON.stringify([]));
+  renderHistory();
+  statusEl.textContent = 'History cleared.';
 });
