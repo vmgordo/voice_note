@@ -89,8 +89,8 @@ let lastRecordingUrl = null; // in-memory only — never persisted
 let currentHistoryId = null;
 let historyUpdateTimer = null;
 
-let pausedForCameraReason = null; // set while paused specifically for Add Photo/Video, so the safety net below can explain what happened if the mic doesn't survive
-let interruptedByCameraMessage = null; // queued explanation, shown after transcribe() finishes rather than set directly — mediaRecorder's own auto-stop-on-track-end fires transcribe() almost immediately, which would otherwise overwrite a message set here before it's ever seen
+let recordingSegments = []; // audio blobs, one per continuous segment — stitched together at Stop
+let pausedViaSegmentSplit = false; // true when the current pause released the mic entirely (camera flow), vs a plain in-place pause
 
 let fileShareUnreliable = false; // set once canShare() proves untrustworthy on this browser this session
 
@@ -241,7 +241,18 @@ document.addEventListener('visibilitychange', async () => {
 });
 
 // ============================================================
-// Recording controls
+// Recording controls — segment-based, so a photo/video mid-recording
+// never risks losing audio. Rather than trying to keep one microphone
+// connection alive through the camera interruption (unreliable — depends
+// entirely on whether the OS lets it survive, which varies by phone and
+// is outside this app's control), each camera trip cleanly finishes the
+// current segment, and a fresh microphone connection is reacquired the
+// moment the camera returns control. All segments are stitched together
+// (at the decoded-audio level, for reliable transcription) when you
+// finally tap Stop. Reacquiring a *fresh* connection after an
+// interruption is a normal, well-supported operation — unlike keeping an
+// old one alive through it — which is what makes this approach reliable
+// where the previous pause-and-hope approach wasn't.
 // ============================================================
 function pickMimeType() {
   const candidates = ['audio/mp4', 'audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus'];
@@ -249,6 +260,24 @@ function pickMimeType() {
     if (window.MediaRecorder && MediaRecorder.isTypeSupported(type)) return type;
   }
   return '';
+}
+
+// Safety net: if the OS reclaims the mic unexpectedly (a phone call, or
+// anything other than our own deliberate camera-triggered release), the
+// browser auto-stops the recorder per spec — this keeps our UI state
+// from getting stuck out of sync when that happens.
+function attachTrackSafetyNet(stream) {
+  stream.getAudioTracks().forEach((track) => {
+    track.addEventListener('ended', () => {
+      if (recState !== 'idle') {
+        clearInterval(timerInterval);
+        recState = 'idle';
+        pausedViaSegmentSplit = false;
+        showIdleUI();
+        releaseWakeLock();
+      }
+    });
+  });
 }
 
 function showRecordingUI() {
@@ -296,64 +325,36 @@ async function startRecording() {
   hide(retryBtn);
   lastRecordingBlob = null;
   currentHistoryId = null;
+  recordingSegments = [];
+  pausedViaSegmentSplit = false;
+  elapsedBeforePause = 0;
 
+  beginSegment(stream);
+
+  recState = 'recording';
+  showRecordingUI();
+  statusEl.textContent = 'Recording...';
+
+  await acquireWakeLock();
+}
+
+// Starts a fresh MediaRecorder on a fresh stream. Used for the initial
+// recording and to resume after a camera-triggered pause, where the
+// previous mic connection was deliberately released rather than kept
+// alive through the interruption.
+function beginSegment(stream) {
   chunks = [];
   recordMimeType = pickMimeType();
   mediaRecorder = recordMimeType
     ? new MediaRecorder(stream, { mimeType: recordMimeType })
     : new MediaRecorder(stream);
   mediaRecorder.ondataavailable = (e) => chunks.push(e.data);
-  mediaRecorder.onstop = onRecordingStopped;
+  mediaRecorder.onstop = onSegmentStopped;
   mediaRecorder.start();
-
-  // Safety net: if the OS reclaims the mic for another app (phone call, or
-  // opening the camera without going through stopRecordingForCamera below),
-  // the browser auto-stops the recorder per spec — this keeps our own UI
-  // state from getting stuck out of sync when that happens, and explains
-  // clearly what happened if it was specifically the camera that caused it
-  // (this is intermittent and outside the app's control — some phones let
-  // a paused recording survive opening the camera, many don't).
-  stream.getAudioTracks().forEach((track) => {
-    track.addEventListener('ended', () => {
-      if (recState !== 'idle') {
-        clearInterval(timerInterval);
-        recState = 'idle';
-        showIdleUI();
-        releaseWakeLock();
-        if (pausedForCameraReason) {
-          // Don't set statusEl directly here — mediaRecorder's own spec-mandated
-          // auto-stop (all tracks ended) fires transcribe() right after this,
-          // which would immediately overwrite a message set here. Queue it
-          // instead so transcribe() can append it once it's actually done.
-          interruptedByCameraMessage = "This recording was cut short because the camera closed the microphone (this varies by phone) — what was captured before that is transcribed below.";
-          // Fallback: normally transcribe() (triggered by mediaRecorder's own
-          // auto-stop when all tracks end) picks this message up and appends
-          // it once done. But that depends on the browser firing its internal
-          // auto-stop and this 'ended' event in a reliable order, which isn't
-          // guaranteed — so if nothing has consumed the message shortly, show
-          // it directly rather than risk it being silently lost.
-          setTimeout(() => {
-            if (interruptedByCameraMessage) {
-              statusEl.textContent = interruptedByCameraMessage;
-              interruptedByCameraMessage = null;
-            }
-          }, 600);
-        }
-      }
-      pausedForCameraReason = null;
-    });
-  });
-
-  recState = 'recording';
-  showRecordingUI();
-  statusEl.textContent = 'Recording...';
-
-  elapsedBeforePause = 0;
+  attachTrackSafetyNet(stream);
   segmentStart = Date.now();
-  updateTimer();
   timerInterval = setInterval(updateTimer, 1000);
-
-  await acquireWakeLock();
+  updateTimer();
 }
 
 function pauseRecording() {
@@ -362,14 +363,18 @@ function pauseRecording() {
   clearInterval(timerInterval);
   elapsedBeforePause += Math.floor((Date.now() - segmentStart) / 1000);
   recState = 'paused';
+  pausedViaSegmentSplit = false;
   showRecordingUI();
   statusEl.textContent = 'Paused.';
 }
 
 function resumeRecording() {
   if (recState !== 'paused') return;
+  if (pausedViaSegmentSplit) {
+    resumeAfterSegmentSplit();
+    return;
+  }
   mediaRecorder.resume();
-  pausedForCameraReason = null;
   segmentStart = Date.now();
   timerInterval = setInterval(updateTimer, 1000);
   recState = 'recording';
@@ -387,40 +392,79 @@ function updateTimer() {
 
 function stopRecording() {
   if (recState === 'idle') return;
-  mediaRecorder.stop();
-  mediaRecorder.stream.getTracks().forEach((t) => t.stop());
   clearInterval(timerInterval);
   recState = 'idle';
-  pausedForCameraReason = null;
+  pausedViaSegmentSplit = false;
   showIdleUI();
   releaseWakeLock();
-}
-
-// Used by Add Photo / Add Video. Opening the camera *can* take the
-// microphone away from us (especially for video capture), but a still
-// photo usually doesn't need the mic at all — so we pause rather than
-// stop, giving the recording a chance to survive and be resumed
-// manually via the existing Resume button. If the OS forcibly kills the
-// mic anyway, the existing track-ended safety net (see startRecording)
-// already handles that cleanly — this function doesn't need to guard
-// against it separately.
-function pauseRecordingForCamera(whatFor) {
-  if (recState === 'recording') {
-    pauseRecording();
-    pausedForCameraReason = whatFor;
-    statusEl.textContent = `Recording paused to open the camera for ${whatFor} — tap Resume when you're ready to continue. (Whether this survives varies by phone — if Resume doesn't work when you get back, what was captured is already saved.)`;
-  } else if (recState === 'paused') {
-    pausedForCameraReason = whatFor;
-    statusEl.textContent = `Still paused — tap Resume when you're ready to continue after adding ${whatFor}.`;
+  if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+    mediaRecorder.stop(); // onSegmentStopped sees recState === 'idle' and finalizes the whole session
+    mediaRecorder.stream.getTracks().forEach((t) => t.stop());
+  } else {
+    // no live recorder right now (stopped mid camera-pause, mic already
+    // released) — finalize directly from whatever segments exist already
+    finishRecordingSession();
   }
-  // idle: nothing to do, just open the camera normally
 }
 
-async function onRecordingStopped() {
+// Used by Add Photo / Add Video. Cleanly finishes the current segment and
+// remembers it; resumeAfterSegmentSplit (below) reconnects the mic and
+// starts a new segment once the camera returns control.
+function pauseRecordingForCamera(whatFor) {
+  if (recState !== 'recording' && recState !== 'paused') return; // idle: nothing to do
+  if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+    mediaRecorder.stop();
+    mediaRecorder.stream.getTracks().forEach((t) => t.stop());
+  }
+  clearInterval(timerInterval);
+  if (recState === 'recording') {
+    elapsedBeforePause += Math.floor((Date.now() - segmentStart) / 1000);
+  }
+  recState = 'paused';
+  pausedViaSegmentSplit = true;
+  showRecordingUI();
+  statusEl.textContent = `Recording paused for ${whatFor} — will resume automatically once you're back.`;
+}
+
+// Called once the camera returns control (photo/video picked), to pick
+// recording back up automatically. Also reachable via the Resume button
+// as a manual fallback if that automatic attempt hasn't run yet or failed.
+async function resumeAfterSegmentSplit() {
+  if (!pausedViaSegmentSplit || recState !== 'paused') return;
+  statusEl.textContent = 'Reconnecting microphone...';
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  } catch (err) {
+    statusEl.textContent = "Couldn't reconnect the microphone automatically — tap Resume to try again, or Stop to finish with what's captured so far.";
+    return;
+  }
+  pausedViaSegmentSplit = false;
+  beginSegment(stream);
+  recState = 'recording';
+  showRecordingUI();
+  statusEl.textContent = 'Recording resumed.';
+  await acquireWakeLock();
+}
+
+async function onSegmentStopped() {
   const blob = new Blob(chunks, { type: recordMimeType || 'audio/webm' });
-  lastRecordingBlob = blob;
-  showAudioPlayback(blob);
-  await transcribe(blob);
+  recordingSegments.push(blob);
+  chunks = [];
+  if (recState === 'idle') {
+    // this was the real, final stop — finalize the whole session
+    await finishRecordingSession();
+  }
+  // otherwise this was a camera-triggered segment split — resumeAfterSegmentSplit
+  // (called from the photo/video 'change' handlers) picks up from here
+}
+
+async function finishRecordingSession() {
+  if (recordingSegments.length === 0) return;
+  const combinedBlob = new Blob(recordingSegments, { type: recordMimeType || 'audio/webm' });
+  lastRecordingBlob = combinedBlob; // best-effort combined file, for playback/Save
+  showAudioPlayback(combinedBlob);
+  await transcribe(recordingSegments);
 }
 
 // ============================================================
@@ -445,7 +489,7 @@ function hideAudioPlayback() {
 // Transcription + retry
 // ============================================================
 retryBtn.addEventListener('click', () => {
-  if (lastRecordingBlob) transcribe(lastRecordingBlob);
+  if (recordingSegments.length) transcribe(recordingSegments);
 });
 
 function suggestTitle(text) {
@@ -453,7 +497,28 @@ function suggestTitle(text) {
   return words.length > 40 ? words.slice(0, 40) + '…' : words;
 }
 
-async function transcribe(blob) {
+// Decodes each segment separately (avoids any container-format issues
+// from naively concatenating independent WebM/MP4 files) and joins the
+// raw decoded samples into one continuous buffer — reliable regardless
+// of how many segments a note ended up split into.
+async function decodeSegments(blobs) {
+  const decoded = [];
+  let totalLength = 0;
+  for (const blob of blobs) {
+    const pcm = await decodeToMono16k(blob);
+    decoded.push(pcm);
+    totalLength += pcm.length;
+  }
+  const combined = new Float32Array(totalLength);
+  let offset = 0;
+  for (const pcm of decoded) {
+    combined.set(pcm, offset);
+    offset += pcm.length;
+  }
+  return combined;
+}
+
+async function transcribe(segments) {
   recordBtn.disabled = true;
   modeFastBtn.disabled = true;
   modeAccurateBtn.disabled = true;
@@ -463,7 +528,7 @@ async function transcribe(blob) {
     const transcriber = await ensureTranscriber(mode);
 
     statusEl.textContent = 'Decoding audio...';
-    const audioData = await decodeToMono16k(blob);
+    const audioData = await decodeSegments(segments);
 
     statusEl.textContent = 'Transcribing...';
     const result = await transcriber(audioData, { chunk_length_s: 30, stride_length_s: 5 });
@@ -479,16 +544,8 @@ async function transcribe(blob) {
     statusEl.textContent = ok
       ? 'Done. Edit below, then share or save.'
       : 'Done — but saving to history failed (storage may be full). Use Save to keep this note.';
-    if (interruptedByCameraMessage) {
-      statusEl.textContent += ' ' + interruptedByCameraMessage;
-      interruptedByCameraMessage = null;
-    }
   } catch (err) {
     statusEl.textContent = 'Error: ' + err.message + ' — you can retry using the recording below.';
-    if (interruptedByCameraMessage) {
-      statusEl.textContent += ' ' + interruptedByCameraMessage;
-      interruptedByCameraMessage = null;
-    }
     show(retryBtn);
   } finally {
     recordBtn.disabled = false;
@@ -578,16 +635,20 @@ addPhotoBtn.addEventListener('click', () => {
 
 photoInput.addEventListener('change', async () => {
   const file = photoInput.files[0];
-  if (!file) return;
-  photoBlob = file;
-  photoImg.src = URL.createObjectURL(file);
-  show(photoPreview);
-  try {
-    currentPhotoDataUrl = await compressPhoto(file);
-  } catch (e) {
-    currentPhotoDataUrl = null;
+  if (file) {
+    photoBlob = file;
+    photoImg.src = URL.createObjectURL(file);
+    show(photoPreview);
+    try {
+      currentPhotoDataUrl = await compressPhoto(file);
+    } catch (e) {
+      currentPhotoDataUrl = null;
+    }
+    updateCurrentHistoryEntry();
   }
-  updateCurrentHistoryEntry();
+  // Resume even if the camera was cancelled with no photo taken — we
+  // already paused for it, so recording should continue either way.
+  if (pausedViaSegmentSplit) await resumeAfterSegmentSplit();
 });
 
 removePhotoBtn.addEventListener('click', () => {
@@ -643,14 +704,17 @@ addVideoBtn.addEventListener('click', () => {
   videoInput.click();
 });
 
-videoInput.addEventListener('change', () => {
+videoInput.addEventListener('change', async () => {
   const file = videoInput.files[0];
-  if (!file) return;
-  videoBlob = file;
-  if (videoUrl) URL.revokeObjectURL(videoUrl);
-  videoUrl = URL.createObjectURL(file);
-  videoPreviewEl.src = videoUrl;
-  show(videoPreview);
+  if (file) {
+    videoBlob = file;
+    if (videoUrl) URL.revokeObjectURL(videoUrl);
+    videoUrl = URL.createObjectURL(file);
+    videoPreviewEl.src = videoUrl;
+    show(videoPreview);
+  }
+  // Resume even if the camera was cancelled with no video taken.
+  if (pausedViaSegmentSplit) await resumeAfterSegmentSplit();
 });
 
 removeVideoBtn.addEventListener('click', clearVideo);
@@ -860,6 +924,7 @@ function loadHistoryItem(item, dateStr) {
   clearVideo(); // no video saved with history entries either
   hide(retryBtn);
   lastRecordingBlob = null;
+  recordingSegments = [];
   currentHistoryId = item.id; // further edits update this same entry
 
   if (item.photo) {

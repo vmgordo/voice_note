@@ -1,38 +1,69 @@
-# Voice Note → Text (stable pre-video version)
+# Voice Note_2 → Text
 
-This is the version restored to match the last known-working UI —
-editable title and transcript, no video capture — with every genuine
-bug fix from later work retained underneath.
+## Versioning
 
-## What's in this version
+The app title (in the header and browser tab) shows a version number
+— "Voice Note_2", "Voice Note_3", etc. — that increments every time a
+new build is delivered, so it's always unmistakable which version
+you're looking at on screen. This exists specifically because earlier
+in development, files from different versions got mixed together
+(different vintages of index.html and app.js uploaded together),
+which caused real, hard-to-diagnose bugs. Always upload every file
+from the same delivery together, and check the on-screen version
+number matches what you expect.
 
-- Record / Pause / Resume / Stop, wake lock, mic-permission handling.
-- Fast/Accurate modes with background model preload, WebGPU→WASM fallback.
-- Editable transcript (numbers re-score live as you correct it) and
-  editable title, both visible in the UI.
-- Photo capture, compressed and saved to history; audio playback,
-  retry, and save.
-- Share and Save, including photo/audio.
-- Previous Notes: search, per-item share/delete(confirm), export,
-  share-backup, import, clear-all.
+`Voice Note_1` (the version before this rework — pause-and-hope for
+photo/video, no guaranteed audio preservation) is preserved as a
+separate download and as git tag `v1-audio-pause-approach`, in case
+you want to compare or revert.
 
-## Bug fixes retained from later work (not tied to the removed features)
+## What changed in Voice Note_2: reliable audio through photo/video
 
-- **Startup crash fix**: `ensureTranscriber`'s dependencies are declared
-  before `setMode()` is called — the earlier version of this file threw
-  a `ReferenceError` at load time that silently prevented almost every
-  button from working.
-- **Share reliability**: exactly one `navigator.share()` call per tap
-  (a second call after a failure always throws "must be handling a
-  user gesture" — this version never does that), plus a fallback that
-  stops trying to attach files for the rest of the session if the
-  browser's `canShare()` proves unreliable.
-- **Camera-interrupt fix**: tapping Add Photo while recording/paused
-  cleanly stops and finalizes the note first, instead of leaving the
-  UI stuck when the OS takes the microphone for the camera app.
-- **Mic-denied handling**: a clear message instead of silent failure.
-- **Safe storage writes**: a full `localStorage` doesn't lose a note
-  silently.
+**The problem:** the previous approach paused the recording and hoped
+the operating system would let the microphone stay reserved while the
+camera was open. Sometimes it did, often it didn't — entirely up to
+the phone's OS, not something the app could control. When it failed,
+recording was cut short unpredictably.
+
+**The new approach:** rather than trying to keep one microphone
+connection alive through the interruption, the app now:
+1. Cleanly finishes and saves whatever's been recorded as a "segment"
+   the moment you tap Add Photo/Video.
+2. Opens the camera with the microphone properly released — no
+   fighting the OS for it.
+3. Automatically reconnects the microphone and starts a new segment
+   the instant you're back (photo taken, video recorded, **or even if
+   you cancel the camera** — either way, recording resumes).
+4. When you tap Stop for real, all segments are decoded and stitched
+   into one continuous transcript — reliably, since audio is joined at
+   the decoded-sample level rather than by concatenating separate
+   media files (which can have format issues).
+
+This works because reacquiring a *fresh* microphone connection after
+an interruption is a normal, well-supported browser operation —
+unlike trying to keep an old connection alive through one, which is
+what made the previous approach unreliable.
+
+Manual Pause/Resume (tapping Pause without opening the camera) is
+unaffected — that still uses simple in-place pausing since there's no
+OS conflict to work around in that case.
+
+**Tested scenarios** (all passing, 31 automated browser-based checks):
+normal recording, single photo interruption with auto-resume, camera
+cancellation, multiple interruptions in one recording (photo + video),
+manual pause/resume, and tapping Stop while a camera interruption is
+still in progress.
+
+## Everything else
+
+Unchanged from the previous version: on-device Whisper transcription
+(Fast/Accurate modes), number confidence (Confirmed/Verify), editable
+title and transcript, Share (text + photo + video — audio intentionally
+excluded, since bundling it caused WhatsApp to reject the whole
+attachment set), Save (includes audio), Previous Notes with search/
+export/import/backup-sharing, and the reliability fixes from earlier
+(startup-crash fix, single-call-per-tap Share, mic-permission handling,
+safe storage writes).
 
 ## File structure
 
@@ -46,48 +77,5 @@ voicenote-app/
 └── icon-512.png
 ```
 
-Deploy via GitHub Pages, same as before — root of the repo, no subfolder.
-
-## Update: pause instead of stop for photo/video, video restored
-
-- **Add Photo / Add Video now pause the recording instead of stopping
-  it.** A still photo doesn't need the microphone, so the recording
-  often survives untouched; tap **Resume** (the existing button) when
-  you're ready to keep recording. If the OS forcibly reclaims the mic
-  anyway (more likely for video, which typically wants audio too), the
-  existing safety net still cleans up the state correctly rather than
-  leaving the UI stuck.
-- **Video capture is back**, alongside Photo, using the same pause-based
-  flow. Video is still not saved to history (too large for
-  `localStorage`) — same as the audio recording.
-- **Share and Save now include text, photo, video, and audio together**
-  — whichever are currently attached.
-
-## Update: audio dropped from Share (kept in Save)
-
-Testing on a real device showed WhatsApp's share handler rejecting the
-*entire* attachment set (falling back to text-only) when an audio file
-was bundled alongside photo/video — most likely because it doesn't
-recognize the audio MIME type and bails on the whole array rather than
-skipping just that item. Share now sends text + photo + video only.
-**Save is unaffected and still includes the audio recording** — if you
-need to send the audio itself, use Save and attach that file manually.
-
-## Update: clearer messaging when the pause-for-camera doesn't survive
-
-Testing surfaced a real race: when the OS reclaims the mic during a
-camera-pause, the app's own status message explaining what happened
-was being immediately overwritten by the transcription pipeline's own
-status updates, milliseconds later — so the explanation never actually
-appeared, which is exactly what made this look like "it just silently
-breaks" rather than "here's what happened." Fixed with a queued
-message that's shown once transcription actually finishes (or via a
-short fallback timer if transcription doesn't pick it up), so the
-explanation reliably survives regardless of the exact timing of
-browser-internal events.
-
-This doesn't change the underlying reality that pausing across a
-camera launch is inherently inconsistent — some phones let it survive,
-many don't, and that's an OS-level resource decision outside this
-app's control. What's fixed is that when it doesn't survive, you now
-get a clear explanation instead of a confusing silent reset.
+Deploy via GitHub Pages — root of the repo, no subfolder, upload all
+files from the same delivery together.
