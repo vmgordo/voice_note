@@ -10,6 +10,7 @@ const MODELS = {
 const HISTORY_KEY = 'voicenote_history';
 const MODE_KEY = 'voicenote_mode';
 const HINT_KEY = 'voicenote_hint_seen';
+const INSTALL_DISMISSED_KEY = 'voicenote_install_dismissed';
 const MAX_HISTORY = 50;
 const HISTORY_UPDATE_DEBOUNCE_MS = 800;
 
@@ -61,6 +62,10 @@ const removeVideoBtn = document.getElementById('removeVideoBtn');
 const helpBtn = document.getElementById('helpBtn');
 const closeHelpBtn = document.getElementById('closeHelpBtn');
 const helpOverlay = document.getElementById('helpOverlay');
+const installBanner = document.getElementById('installBanner');
+const installText = document.getElementById('installText');
+const installBtn = document.getElementById('installBtn');
+const dismissInstallBtn = document.getElementById('dismissInstallBtn');
 
 // ============================================================
 // State
@@ -143,6 +148,102 @@ if ('serviceWorker' in navigator) {
 }
 
 // ============================================================
+// Persistent storage
+// ============================================================
+// Ask the browser to protect this site's stored data (the downloaded
+// speech model, note history) from automatic eviction. Without this,
+// browsers are free to clear cached data whenever storage runs low or
+// the site goes unused for a while — which is why the model can end up
+// re-downloading on later visits. Best-effort by design: unsupported
+// browsers ignore it, and iOS Safari's own privacy cleanup can still
+// override it after prolonged inactivity, which no site can prevent.
+(async () => {
+  try {
+    if (navigator.storage && navigator.storage.persist) {
+      const already = navigator.storage.persisted ? await navigator.storage.persisted() : false;
+      if (!already) await navigator.storage.persist();
+    }
+  } catch (e) {
+    // never block startup on this
+  }
+})();
+
+// ============================================================
+// Install prompt (first visit, browser tab only)
+// ============================================================
+// Two different paths, because the platforms genuinely differ:
+//  - Chrome/Android fires 'beforeinstallprompt', giving us a real
+//    one-tap native install dialog.
+//  - iOS Safari has no install API at all, so the only option is to
+//    show the manual "Share → Add to Home Screen" steps.
+// Never shown when already running as an installed app, or once the
+// person has dismissed or completed it.
+let deferredInstallPrompt = null;
+
+function isRunningStandalone() {
+  return (
+    (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches) ||
+    window.navigator.standalone === true
+  );
+}
+
+function isIos() {
+  return /iphone|ipad|ipod/i.test(navigator.userAgent);
+}
+
+function maybeShowInstallBanner() {
+  if (isRunningStandalone()) return;               // already installed
+  if (localStorage.getItem(INSTALL_DISMISSED_KEY)) return; // already answered
+
+  if (deferredInstallPrompt) {
+    installText.textContent = 'Install this app to your home screen for quicker access and offline use.';
+    installBtn.style.display = 'block';
+    show(installBanner);
+  } else if (isIos()) {
+    // No install API on iOS — show the manual steps instead of a button
+    // that couldn't do anything.
+    installText.textContent = 'To install: tap the Share button below, then "Add to Home Screen" — it opens full screen and works offline.';
+    installBtn.style.display = 'none';
+    show(installBanner);
+  }
+  // Other browsers with no install support: show nothing rather than
+  // instructions that may not match what the person actually sees.
+}
+
+window.addEventListener('beforeinstallprompt', (e) => {
+  e.preventDefault(); // stop the browser's own mini-infobar; we prompt at our own moment
+  deferredInstallPrompt = e;
+  maybeShowInstallBanner();
+});
+
+installBtn.addEventListener('click', async () => {
+  if (!deferredInstallPrompt) return;
+  hide(installBanner);
+  try {
+    deferredInstallPrompt.prompt();
+    await deferredInstallPrompt.userChoice;
+  } catch (e) {
+    // prompt can only be used once; nothing useful to do if it fails
+  }
+  deferredInstallPrompt = null;
+  safeSet(INSTALL_DISMISSED_KEY, '1');
+});
+
+dismissInstallBtn.addEventListener('click', () => {
+  hide(installBanner);
+  safeSet(INSTALL_DISMISSED_KEY, '1');
+});
+
+window.addEventListener('appinstalled', () => {
+  hide(installBanner);
+  safeSet(INSTALL_DISMISSED_KEY, '1');
+  deferredInstallPrompt = null;
+});
+
+// iOS never fires beforeinstallprompt, so check on load for that path.
+maybeShowInstallBanner();
+
+// ============================================================
 // Help modal
 // ============================================================
 helpBtn.addEventListener('click', () => helpOverlay.classList.add('show'));
@@ -207,16 +308,39 @@ function ensureTranscriber(m) {
 // Mode toggle — declared before setMode() is called, avoiding the
 // ReferenceError bug from an earlier version where this ordering was wrong
 // ============================================================
-function setMode(newMode) {
+
+// The background preload is genuinely convenient (recording usually isn't
+// blocked waiting for a download) but shouldn't happen silently over
+// cellular — that would burn a chunk of someone's data plan before they've
+// even decided to use the app, directly contradicting the one-time hint's
+// own "needs Wi-Fi" promise. Where the connection type can't be confirmed
+// at all (iOS Safari has no Network Information API), err on the side of
+// NOT preloading automatically — the model still loads normally the
+// moment Start Recording is tapped, just without the head start.
+function shouldAutoPreload() {
+  const conn = navigator.connection || navigator.webkitConnection || navigator.mozConnection;
+  if (!conn) return false;
+  if (conn.saveData) return false; // respect the browser's own Data Saver setting
+  if (typeof conn.type === 'string') return conn.type === 'wifi';
+  if (typeof conn.effectiveType === 'string') return conn.effectiveType === '4g'; // imperfect fallback where 'type' isn't exposed
+  return false;
+}
+
+function setMode(newMode, userInitiated) {
   mode = newMode;
   safeSet(MODE_KEY, mode);
   modeFastBtn.classList.toggle('active', mode === 'fast');
   modeAccurateBtn.classList.toggle('active', mode === 'accurate');
-  ensureTranscriber(mode).catch(() => {}); // warm up in the background
+  // A manual tap of Fast/Accurate is a deliberate signal of intent to use
+  // the app shortly, so preload regardless of connection type in that case.
+  // The initial, unprompted page-load call is the one that needs to be careful.
+  if (userInitiated || shouldAutoPreload()) {
+    ensureTranscriber(mode).catch(() => {});
+  }
 }
-modeFastBtn.addEventListener('click', () => setMode('fast'));
-modeAccurateBtn.addEventListener('click', () => setMode('accurate'));
-setMode(mode); // also triggers the initial background model warm-up
+modeFastBtn.addEventListener('click', () => setMode('fast', true));
+modeAccurateBtn.addEventListener('click', () => setMode('accurate', true));
+setMode(mode, false); // initial load — only preloads automatically on a confirmed non-cellular connection
 
 // ============================================================
 // Wake Lock
@@ -637,12 +761,22 @@ photoInput.addEventListener('change', async () => {
   const file = photoInput.files[0];
   if (file) {
     photoBlob = file;
-    photoImg.src = URL.createObjectURL(file);
-    show(photoPreview);
     try {
       currentPhotoDataUrl = await compressPhoto(file);
+      // Show the COMPRESSED version in the preview, not the original.
+      // Displaying the full-resolution original would keep that large
+      // decoded bitmap alive in memory for as long as it's on screen —
+      // the same pressure that causes the tab to be killed.
+      photoImg.src = currentPhotoDataUrl;
+      show(photoPreview);
+      // Keep memory bounded: hold the small version as the working copy
+      // rather than the original camera file.
+      photoBlob = dataURLtoBlob(currentPhotoDataUrl);
     } catch (e) {
       currentPhotoDataUrl = null;
+      photoBlob = null;
+      hide(photoPreview);
+      statusEl.textContent = 'Could not process that photo: ' + e.message;
     }
     updateCurrentHistoryEntry();
   }
@@ -659,19 +793,72 @@ removePhotoBtn.addEventListener('click', () => {
 function clearPhoto() {
   photoBlob = null;
   photoInput.value = '';
+  photoImg.removeAttribute('src');
   hide(photoPreview);
   currentPhotoDataUrl = null;
 }
 
-function compressPhoto(blob) {
-  return new Promise((resolve, reject) => {
+// Memory-safe photo processing.
+//
+// The previous implementation loaded the photo into an <img> element,
+// which forces the browser to fully decode the ORIGINAL full-resolution
+// image into memory before it can be scaled down. A modern phone photo
+// (12+ megapixels) can occupy 40-50MB+ as a raw decoded bitmap even
+// though the file itself is a few MB — and mobile browsers (iOS Safari
+// especially) have tight per-tab memory limits. Exceeding one doesn't
+// throw a catchable error; the browser kills and reloads the whole page,
+// which is exactly the "app randomly resets after taking a photo"
+// symptom, and why it varied by image (bigger pixel dimensions = more
+// memory, regardless of compressed file size).
+//
+// createImageBitmap() with resize options lets the browser decode
+// straight to (approximately) the target size, so the giant intermediate
+// bitmap never has to exist. Falls back to the old <img> path only where
+// that API isn't available, and guards that fallback with a size check.
+const PHOTO_MAX_WIDTH = 640;
+const PHOTO_FALLBACK_MAX_BYTES = 8 * 1024 * 1024; // only applies to the legacy fallback path
+
+async function compressPhoto(blob) {
+  if (typeof createImageBitmap === 'function') {
+    let bitmap = null;
+    try {
+      // Ask for the resize during decode — the key memory saving.
+      try {
+        bitmap = await createImageBitmap(blob, {
+          resizeWidth: PHOTO_MAX_WIDTH,
+          resizeQuality: 'medium',
+        });
+      } catch (e) {
+        // Some browsers reject the resize options but handle plain decode fine.
+        bitmap = await createImageBitmap(blob);
+      }
+
+      const scale = Math.min(1, PHOTO_MAX_WIDTH / bitmap.width);
+      const w = Math.max(1, Math.round(bitmap.width * scale));
+      const h = Math.max(1, Math.round(bitmap.height * scale));
+      const canvas = document.createElement('canvas');
+      canvas.width = w;
+      canvas.height = h;
+      canvas.getContext('2d').drawImage(bitmap, 0, 0, w, h);
+      return canvas.toDataURL('image/jpeg', 0.6);
+    } finally {
+      // Release the decoded pixels promptly rather than waiting for GC.
+      if (bitmap && typeof bitmap.close === 'function') bitmap.close();
+    }
+  }
+
+  // Legacy fallback (older browsers without createImageBitmap). Refuse
+  // very large files here rather than risk the full-decode crash.
+  if (blob.size > PHOTO_FALLBACK_MAX_BYTES) {
+    throw new Error('This photo is too large for this browser to process safely.');
+  }
+  return await new Promise((resolve, reject) => {
     const img = new Image();
     const objectUrl = URL.createObjectURL(blob);
     img.onload = () => {
-      const maxW = 640;
-      const scale = Math.min(1, maxW / img.width);
-      const w = Math.round(img.width * scale);
-      const h = Math.round(img.height * scale);
+      const scale = Math.min(1, PHOTO_MAX_WIDTH / img.width);
+      const w = Math.max(1, Math.round(img.width * scale));
+      const h = Math.max(1, Math.round(img.height * scale));
       const canvas = document.createElement('canvas');
       canvas.width = w;
       canvas.height = h;

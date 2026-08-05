@@ -1,4 +1,4 @@
-# Voice Note_2 → Text
+# Voice Note_3 → Text
 
 ## Versioning
 
@@ -79,3 +79,43 @@ voicenote-app/
 
 Deploy via GitHub Pages — root of the repo, no subfolder, upload all
 files from the same delivery together.
+
+
+## Voice Note_3 changes
+
+**1. Photo crash fixed (the "app resets after taking a photo" bug).**
+The old code loaded each photo into an `<img>` element, which forces the
+browser to fully decode the ORIGINAL full-resolution image into memory
+before scaling it down. A 12-megapixel phone photo can occupy 40-50MB+
+as a raw decoded bitmap even when the file itself is only a few MB — and
+mobile browsers (iOS Safari especially) kill and reload the whole tab
+when a per-tab memory limit is exceeded. That reload is exactly what
+looked like "the app reset", and it explains why some photos triggered
+it and others didn't: it depends on pixel dimensions, not file size.
+
+Now uses `createImageBitmap()` with resize-during-decode, so the huge
+intermediate bitmap never has to exist. Also fixed a second related
+leak: the preview was displaying the full-resolution original, keeping
+that large bitmap alive on screen — it now shows the compressed version.
+Verified with a 3000x3000 test image: processed with no crash, down to
+about 4KB.
+
+**2. Persistent storage requested.** The app now calls
+`navigator.storage.persist()`, asking the browser to protect its stored
+data (the downloaded speech model, note history) from automatic
+eviction. This is why the model could end up re-downloading on later
+visits. Best-effort: unsupported browsers ignore it, and iOS Safari's
+own privacy cleanup can still override it after prolonged inactivity —
+no website can prevent that.
+
+**3. Install prompt on first visit.** A banner now offers to add the app
+to the home screen. Two paths, because the platforms differ: Chrome/
+Android gets a real one-tap native install dialog; iOS Safari (which has
+no install API at all) gets the manual "Share -> Add to Home Screen"
+steps instead of a button that couldn't do anything. Never shown when
+already running as an installed app, or once dismissed.
+
+**Testing:** 51 automated browser checks passing — the 15 new ones above
+plus full regression runs of every previous suite (recording, segment
+splitting across camera interruptions, cancellation, multiple
+interruptions, manual pause/resume, stop mid-interruption, share/save).
