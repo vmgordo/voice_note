@@ -72,3 +72,22 @@ recognize the audio MIME type and bails on the whole array rather than
 skipping just that item. Share now sends text + photo + video only.
 **Save is unaffected and still includes the audio recording** — if you
 need to send the audio itself, use Save and attach that file manually.
+
+## Update: clearer messaging when the pause-for-camera doesn't survive
+
+Testing surfaced a real race: when the OS reclaims the mic during a
+camera-pause, the app's own status message explaining what happened
+was being immediately overwritten by the transcription pipeline's own
+status updates, milliseconds later — so the explanation never actually
+appeared, which is exactly what made this look like "it just silently
+breaks" rather than "here's what happened." Fixed with a queued
+message that's shown once transcription actually finishes (or via a
+short fallback timer if transcription doesn't pick it up), so the
+explanation reliably survives regardless of the exact timing of
+browser-internal events.
+
+This doesn't change the underlying reality that pausing across a
+camera launch is inherently inconsistent — some phones let it survive,
+many don't, and that's an OS-level resource decision outside this
+app's control. What's fixed is that when it doesn't survive, you now
+get a clear explanation instead of a confusing silent reset.

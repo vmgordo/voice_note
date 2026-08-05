@@ -89,6 +89,9 @@ let lastRecordingUrl = null; // in-memory only — never persisted
 let currentHistoryId = null;
 let historyUpdateTimer = null;
 
+let pausedForCameraReason = null; // set while paused specifically for Add Photo/Video, so the safety net below can explain what happened if the mic doesn't survive
+let interruptedByCameraMessage = null; // queued explanation, shown after transcribe() finishes rather than set directly — mediaRecorder's own auto-stop-on-track-end fires transcribe() almost immediately, which would otherwise overwrite a message set here before it's ever seen
+
 let fileShareUnreliable = false; // set once canShare() proves untrustworthy on this browser this session
 
 // ============================================================
@@ -306,7 +309,10 @@ async function startRecording() {
   // Safety net: if the OS reclaims the mic for another app (phone call, or
   // opening the camera without going through stopRecordingForCamera below),
   // the browser auto-stops the recorder per spec — this keeps our own UI
-  // state from getting stuck out of sync when that happens.
+  // state from getting stuck out of sync when that happens, and explains
+  // clearly what happened if it was specifically the camera that caused it
+  // (this is intermittent and outside the app's control — some phones let
+  // a paused recording survive opening the camera, many don't).
   stream.getAudioTracks().forEach((track) => {
     track.addEventListener('ended', () => {
       if (recState !== 'idle') {
@@ -314,7 +320,27 @@ async function startRecording() {
         recState = 'idle';
         showIdleUI();
         releaseWakeLock();
+        if (pausedForCameraReason) {
+          // Don't set statusEl directly here — mediaRecorder's own spec-mandated
+          // auto-stop (all tracks ended) fires transcribe() right after this,
+          // which would immediately overwrite a message set here. Queue it
+          // instead so transcribe() can append it once it's actually done.
+          interruptedByCameraMessage = "This recording was cut short because the camera closed the microphone (this varies by phone) — what was captured before that is transcribed below.";
+          // Fallback: normally transcribe() (triggered by mediaRecorder's own
+          // auto-stop when all tracks end) picks this message up and appends
+          // it once done. But that depends on the browser firing its internal
+          // auto-stop and this 'ended' event in a reliable order, which isn't
+          // guaranteed — so if nothing has consumed the message shortly, show
+          // it directly rather than risk it being silently lost.
+          setTimeout(() => {
+            if (interruptedByCameraMessage) {
+              statusEl.textContent = interruptedByCameraMessage;
+              interruptedByCameraMessage = null;
+            }
+          }, 600);
+        }
       }
+      pausedForCameraReason = null;
     });
   });
 
@@ -343,6 +369,7 @@ function pauseRecording() {
 function resumeRecording() {
   if (recState !== 'paused') return;
   mediaRecorder.resume();
+  pausedForCameraReason = null;
   segmentStart = Date.now();
   timerInterval = setInterval(updateTimer, 1000);
   recState = 'recording';
@@ -364,6 +391,7 @@ function stopRecording() {
   mediaRecorder.stream.getTracks().forEach((t) => t.stop());
   clearInterval(timerInterval);
   recState = 'idle';
+  pausedForCameraReason = null;
   showIdleUI();
   releaseWakeLock();
 }
@@ -379,8 +407,10 @@ function stopRecording() {
 function pauseRecordingForCamera(whatFor) {
   if (recState === 'recording') {
     pauseRecording();
-    statusEl.textContent = `Recording paused to open the camera for ${whatFor} — tap Resume when you're ready to continue.`;
+    pausedForCameraReason = whatFor;
+    statusEl.textContent = `Recording paused to open the camera for ${whatFor} — tap Resume when you're ready to continue. (Whether this survives varies by phone — if Resume doesn't work when you get back, what was captured is already saved.)`;
   } else if (recState === 'paused') {
+    pausedForCameraReason = whatFor;
     statusEl.textContent = `Still paused — tap Resume when you're ready to continue after adding ${whatFor}.`;
   }
   // idle: nothing to do, just open the camera normally
@@ -449,8 +479,16 @@ async function transcribe(blob) {
     statusEl.textContent = ok
       ? 'Done. Edit below, then share or save.'
       : 'Done — but saving to history failed (storage may be full). Use Save to keep this note.';
+    if (interruptedByCameraMessage) {
+      statusEl.textContent += ' ' + interruptedByCameraMessage;
+      interruptedByCameraMessage = null;
+    }
   } catch (err) {
     statusEl.textContent = 'Error: ' + err.message + ' — you can retry using the recording below.';
+    if (interruptedByCameraMessage) {
+      statusEl.textContent += ' ' + interruptedByCameraMessage;
+      interruptedByCameraMessage = null;
+    }
     show(retryBtn);
   } finally {
     recordBtn.disabled = false;

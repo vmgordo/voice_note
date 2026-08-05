@@ -1,5 +1,5 @@
-const CACHE = 'voicenote-shell-stable-v3';
-const CDN_CACHE = 'voicenote-cdn-stable-v3';
+const CACHE = 'voicenote-shell-stable-v4';
+const CDN_CACHE = 'voicenote-cdn-stable-v4';
 const SHELL = ['./', './index.html', './app.js', './manifest.json', './icon-192.png', './icon-512.png'];
 
 self.addEventListener('install', (e) => {
