@@ -6,7 +6,7 @@
 <meta name="theme-color" content="#1a1a1a" />
 <link rel="manifest" href="./manifest.json" />
 <link rel="apple-touch-icon" href="./icon-192.png" />
-<title>Voice Note to Text</title>
+<title>Voice Note_1 to Text</title>
 <style>
   :root {
     color-scheme: dark;
@@ -36,7 +36,6 @@
     width: 36px; height: 36px; border-radius: 50%; padding: 0; margin: 0;
     font-size: 1.05rem; font-weight: 700; background: var(--slate); color: #fff;
     flex-shrink: 0; display: flex; align-items: center; justify-content: center;
-    border: none; cursor: pointer;
   }
 
   button {
@@ -58,6 +57,7 @@
   button[data-color="indigo"] { background: var(--indigo); color: #fff; }
   button[data-color="sky"] { background: var(--sky); color: #052030; }
 
+  /* fade transition helper — JS toggles display + .visible together */
   .fade { opacity: 0; transition: opacity 200ms ease; }
   .fade.visible { opacity: 1; }
 
@@ -78,12 +78,6 @@
   #modelProgressWrap { margin-top: 8px; display: none; }
   #modelProgressBar { background: #222; border-radius: 6px; height: 8px; overflow: hidden; }
   #modelProgressFill { background: var(--green); height: 100%; width: 0%; transition: width 150ms ease; }
-  #modelProgressFill.indeterminate { animation: indeterminate-slide 1.2s infinite ease-in-out; transition: none; }
-  @keyframes indeterminate-slide {
-    0% { margin-left: 0%; width: 30%; }
-    50% { width: 55%; }
-    100% { margin-left: 100%; width: 30%; }
-  }
 
   #retryBtn { display: none; }
   #audioPlayer { width: 100%; margin-top: 10px; display: none; }
@@ -99,9 +93,6 @@
   }
   textarea { min-height: 100px; resize: vertical; }
   #summary { min-height: 150px; }
-  textarea[readonly] { background: #191919; color: #999; cursor: default; }
-
-  #noteTitleRow { display: none; }
 
   #numbersSection { display: none; }
   .numbers-group { margin-bottom: 12px; }
@@ -116,22 +107,21 @@
   .row { display: flex; gap: 10px; }
   .row button { margin-top: 0; }
 
-  #photoInput, #videoInput { display: none; }
-  #photoPreview, #videoPreview { display: none; position: relative; margin-top: 10px; }
-  #photoImg, #videoPreviewEl { width: 100%; border-radius: 8px; display: block; }
-  #removePhotoBtn, #removeVideoBtn { position: absolute; top: 8px; right: 8px; width: auto; padding: 6px 12px; margin-top: 0; }
+  #photoInput { display: none; }
+  #photoPreview { display: none; position: relative; margin-top: 10px; }
+  #photoImg { width: 100%; border-radius: 8px; display: block; }
+  #removePhotoBtn { position: absolute; top: 8px; right: 8px; width: auto; padding: 6px 12px; margin-top: 0; }
+
+  #videoInput { display: none; }
+  #videoPreview { display: none; position: relative; margin-top: 10px; }
+  #videoPreviewEl { width: 100%; border-radius: 8px; display: block; }
+  #removeVideoBtn { position: absolute; top: 8px; right: 8px; width: auto; padding: 6px 12px; margin-top: 0; }
 
   #historyPanel { display: none; margin-top: 16px; border-top: 1px solid #333; padding-top: 12px; }
   #historyPanel.show { display: block; }
-  .history-actions { display: flex; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; }
-  .history-actions button { margin-top: 0; font-size: 0.85rem; padding: 10px; flex: 1; min-width: 45%; }
+  .history-actions { display: flex; gap: 8px; margin-bottom: 12px; }
+  .history-actions button { margin-top: 0; font-size: 0.85rem; padding: 10px; }
   #historySearch { margin-bottom: 12px; }
-  #backupReminder {
-    display: none; background: #2a2205; border: 1px solid var(--amber);
-    border-radius: 8px; padding: 12px; margin-bottom: 12px; font-size: 0.85rem; color: #f5d76e;
-  }
-  #backupReminder p { margin: 0 0 8px; }
-  #backupReminder button { margin-top: 0; }
   .history-item {
     display: flex; justify-content: space-between; align-items: center;
     background: #222; border-radius: 8px; padding: 10px 12px; margin-bottom: 8px; cursor: pointer;
@@ -161,7 +151,7 @@
 </head>
 <body>
   <div class="header-row">
-    <h1>Voice Note → Text</h1>
+    <h1>Voice Note_1 → Text</h1>
     <button id="helpBtn" class="icon-btn" aria-label="How to use this app">?</button>
   </div>
 
@@ -185,14 +175,13 @@
     <div id="modelProgressBar"><div id="modelProgressFill"></div></div>
   </div>
   <button id="retryBtn" class="fade" data-color="amber">Retry Transcription</button>
+  <audio id="audioPlayer" class="fade" controls></audio>
 
-  <div id="noteTitleRow">
-    <label for="noteTitle">Title</label>
-    <input type="text" id="noteTitle" />
-  </div>
+  <label for="noteTitle">Title (optional)</label>
+  <input type="text" id="noteTitle" placeholder="Auto-filled from transcript if left blank" />
 
-  <label for="transcript">Transcript (read-only — edit the message below instead)</label>
-  <textarea id="transcript" readonly placeholder="Transcript will appear here..."></textarea>
+  <label for="transcript">Transcript (edit as needed)</label>
+  <textarea id="transcript" placeholder="Transcript will appear here..."></textarea>
 
   <div id="numbersSection" class="fade">
     <label>Numbers found</label>
@@ -201,7 +190,6 @@
 
   <label for="summary">Message to send</label>
   <textarea id="summary" placeholder="Edit this into the message you want to send..."></textarea>
-  <audio id="audioPlayer" class="fade" controls></audio>
 
   <div class="row">
     <button id="addPhotoBtn" data-color="sky">Add Photo</button>
@@ -229,7 +217,6 @@
 
   <div id="historyPanel">
     <label style="margin-top:0">Previous notes</label>
-    <div id="backupReminder" class="fade"></div>
     <div class="history-actions">
       <button id="exportBtn" data-color="teal">Export All (JSON)</button>
       <button id="shareBackupBtn" data-color="blue">Share Backup</button>
@@ -249,14 +236,14 @@
       </div>
       <ul>
         <li><strong>Record:</strong> tap Start. Use Pause/Resume if you need a break, Stop when you're done.</li>
-        <li><strong>Fast vs Accurate:</strong> Fast transcribes quicker but with more mistakes; Accurate is slower but more precise. Pick with the toggle at the top — it's remembered next time, and loads quietly in the background so it's usually ready before you need it.</li>
-        <li><strong>Numbers:</strong> after transcribing, numbers said more than once show green ("Confirmed"); numbers said only once show amber ("Verify") — those are worth double-checking against the playback.</li>
-        <li><strong>Playback:</strong> use the audio player under the message box to listen back to what you actually said.</li>
-        <li><strong>Transcript vs Message:</strong> the transcript is read-only — exactly what was transcribed. Edit the message box instead; that's what gets shared or saved, and it saves automatically as you type.</li>
-        <li><strong>Photo / Video:</strong> tap "Add Photo" or "Add Video" to open your camera and attach it to this note. Video (like the audio recording) is only kept for the current session — not saved into Previous Notes.</li>
-        <li><strong>Share:</strong> sends the message plus whichever of photo/video/audio are attached, via WhatsApp, Mail, Drive, Dropbox, or whatever's installed. Works from the main screen or directly from a note in Previous Notes.</li>
-        <li><strong>Save:</strong> downloads the message as a text file, plus the photo, video, and recording for whichever are attached.</li>
-        <li><strong>Previous Notes:</strong> search, browse past notes, share or delete individual ones, export/share your whole history as a backup, import a backup back in, or clear everything.</li>
+        <li><strong>Fast vs Accurate:</strong> Fast transcribes quicker but with more mistakes; Accurate is slower but more precise. Pick with the toggle at the top — it's remembered next time, and that model loads quietly in the background so it's usually ready before you need it.</li>
+        <li><strong>Numbers:</strong> after transcribing, numbers said more than once show green ("Confirmed"); numbers said only once show amber ("Verify") — those are the ones worth double-checking.</li>
+        <li><strong>Playback:</strong> use the audio player under the record buttons to listen back to what you actually said, especially for amber numbers.</li>
+        <li><strong>Edit:</strong> fix anything in the title, transcript, or message boxes any time — your changes save automatically as you type.</li>
+        <li><strong>Photo / Video:</strong> tap "Add Photo" or "Add Video" to open your camera. If you're mid-recording, this pauses your recording (doesn't stop it) while the camera is open — tap Resume when you're done to keep going.</li>
+        <li><strong>Share:</strong> sends the message, photo, video, and original recording (whichever are attached) via WhatsApp, Mail, Google Drive, Dropbox, or whatever's installed. Works from the main screen or directly from a note in Previous Notes.</li>
+        <li><strong>Save:</strong> downloads the message as a text file, plus the photo, video, and original recording for whichever are attached (video and recording are only available right after you capture them, not for reopened past notes).</li>
+        <li><strong>Previous Notes:</strong> search, browse past notes by date, export your whole history as a backup file, share that backup file (e.g. straight to Drive/Dropbox), import a backup back in, or clear everything.</li>
       </ul>
     </div>
   </div>
