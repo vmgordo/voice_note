@@ -10,14 +10,11 @@ const MODELS = {
 const HISTORY_KEY = 'voicenote_history';
 const MODE_KEY = 'voicenote_mode';
 const HINT_KEY = 'voicenote_hint_seen';
-const NOTE_COUNTER_KEY = 'voicenote_note_counter';
-const BACKUP_MARKER_KEY = 'voicenote_backup_marker';
 const MAX_HISTORY = 50;
 const HISTORY_UPDATE_DEBOUNCE_MS = 800;
-const BACKUP_REMINDER_THRESHOLD = 20;
 
 // ============================================================
-// Element references
+// Element references — matched exactly to this HTML's IDs
 // ============================================================
 const recordBtn = document.getElementById('recordBtn');
 const recRow = document.querySelector('.rec-row');
@@ -44,7 +41,6 @@ const historyBtn = document.getElementById('historyBtn');
 const historyPanel = document.getElementById('historyPanel');
 const historySearchEl = document.getElementById('historySearch');
 const historyList = document.getElementById('historyList');
-const backupReminderEl = document.getElementById('backupReminder');
 const modeFastBtn = document.getElementById('modeFast');
 const modeAccurateBtn = document.getElementById('modeAccurate');
 const exportBtn = document.getElementById('exportBtn');
@@ -164,19 +160,20 @@ if (!localStorage.getItem(HINT_KEY)) {
 // ============================================================
 const transcriberPromises = {};
 
-function makeProgressHandler() {
+function makeProgressHandler(m) {
   return (p) => {
     if (p.status === 'progress') {
-      modelProgressFill.classList.remove('indeterminate');
       show(modelProgressWrap);
-      modelProgressFill.style.width = Math.round(p.progress) + '%';
+      const pct = Math.round(p.progress);
+      modelProgressFill.style.width = pct + '%';
+      statusEl.textContent = `Downloading ${m === 'fast' ? 'Fast' : 'Accurate'} speech model: ${pct}%`;
     }
   };
 }
 
 async function loadTranscriber(m) {
   const modelId = MODELS[m];
-  const progressCb = makeProgressHandler();
+  const progressCb = makeProgressHandler(m);
   if (typeof navigator !== 'undefined' && navigator.gpu) {
     try {
       return await pipeline('automatic-speech-recognition', modelId, {
@@ -197,25 +194,15 @@ async function loadTranscriber(m) {
 function ensureTranscriber(m) {
   if (!transcriberPromises[m]) {
     transcriberPromises[m] = loadTranscriber(m)
-      .then((t) => { hideProgress(); return t; })
+      .then((t) => { hide(modelProgressWrap); return t; })
       .catch((err) => { delete transcriberPromises[m]; throw err; });
   }
   return transcriberPromises[m];
 }
 
-// non-percentage steps (decoding, transcribing) — animated bar, no real % available
-function showIndeterminateProgress() {
-  modelProgressFill.classList.add('indeterminate');
-  modelProgressFill.style.width = '';
-  show(modelProgressWrap);
-}
-function hideProgress() {
-  modelProgressFill.classList.remove('indeterminate');
-  hide(modelProgressWrap);
-}
-
 // ============================================================
-// Mode toggle
+// Mode toggle — declared before setMode() is called, avoiding the
+// ReferenceError bug from an earlier version where this ordering was wrong
 // ============================================================
 function setMode(newMode) {
   mode = newMode;
@@ -381,13 +368,22 @@ function stopRecording() {
   releaseWakeLock();
 }
 
-// Used by Add Photo / Add Video — opening the camera takes the mic away
-// from us regardless, so we stop on purpose (finalizing the note) instead
-// of letting that happen as an uncontrolled interruption.
-function stopRecordingForCamera(whatFor) {
-  if (recState === 'idle') return;
-  stopRecording();
-  statusEl.textContent = `Recording stopped to open the camera for ${whatFor} — your note is being saved.`;
+// Used by Add Photo / Add Video. Opening the camera *can* take the
+// microphone away from us (especially for video capture), but a still
+// photo usually doesn't need the mic at all — so we pause rather than
+// stop, giving the recording a chance to survive and be resumed
+// manually via the existing Resume button. If the OS forcibly kills the
+// mic anyway, the existing track-ended safety net (see startRecording)
+// already handles that cleanly — this function doesn't need to guard
+// against it separately.
+function pauseRecordingForCamera(whatFor) {
+  if (recState === 'recording') {
+    pauseRecording();
+    statusEl.textContent = `Recording paused to open the camera for ${whatFor} — tap Resume when you're ready to continue.`;
+  } else if (recState === 'paused') {
+    statusEl.textContent = `Still paused — tap Resume when you're ready to continue after adding ${whatFor}.`;
+  }
+  // idle: nothing to do, just open the camera normally
 }
 
 async function onRecordingStopped() {
@@ -422,14 +418,9 @@ retryBtn.addEventListener('click', () => {
   if (lastRecordingBlob) transcribe(lastRecordingBlob);
 });
 
-function dateHourLabel(date) {
-  return date.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric' });
-}
 function suggestTitle(text) {
   const words = text.trim().split(/\s+/).slice(0, 6).join(' ');
-  const snippet = words.length > 40 ? words.slice(0, 40) + '…' : words;
-  const label = dateHourLabel(new Date());
-  return snippet ? `${label} — ${snippet}` : label;
+  return words.length > 40 ? words.slice(0, 40) + '…' : words;
 }
 
 async function transcribe(blob) {
@@ -442,12 +433,10 @@ async function transcribe(blob) {
     const transcriber = await ensureTranscriber(mode);
 
     statusEl.textContent = 'Decoding audio...';
-    showIndeterminateProgress();
     const audioData = await decodeToMono16k(blob);
 
     statusEl.textContent = 'Transcribing...';
     const result = await transcriber(audioData, { chunk_length_s: 30, stride_length_s: 5 });
-    hideProgress();
 
     const text = result.text.trim();
     transcriptEl.value = text;
@@ -461,7 +450,6 @@ async function transcribe(blob) {
       ? 'Done. Edit below, then share or save.'
       : 'Done — but saving to history failed (storage may be full). Use Save to keep this note.';
   } catch (err) {
-    hideProgress();
     statusEl.textContent = 'Error: ' + err.message + ' — you can retry using the recording below.';
     show(retryBtn);
   } finally {
@@ -515,8 +503,13 @@ function renderNumbers(text) {
 }
 
 // ============================================================
-// Live edits (message/title only — transcript is read-only)
+// Live edits — transcript is editable in this version, so fixing a number
+// by hand re-scores the badges immediately; message and title sync too
 // ============================================================
+transcriptEl.addEventListener('input', () => {
+  renderNumbers(transcriptEl.value);
+  scheduleHistoryUpdate();
+});
 summaryEl.addEventListener('input', scheduleHistoryUpdate);
 noteTitleEl.addEventListener('input', scheduleHistoryUpdate);
 
@@ -541,7 +534,7 @@ function updateCurrentHistoryEntry() {
 // Photo
 // ============================================================
 addPhotoBtn.addEventListener('click', () => {
-  stopRecordingForCamera('the photo');
+  pauseRecordingForCamera('the photo');
   photoInput.click();
 });
 
@@ -608,7 +601,7 @@ function dataURLtoBlob(dataUrl) {
 // Video — in-memory only, never persisted to history (too large)
 // ============================================================
 addVideoBtn.addEventListener('click', () => {
-  stopRecordingForCamera('the video');
+  pauseRecordingForCamera('the video');
   videoInput.click();
 });
 
@@ -638,6 +631,7 @@ function extForVideoMime(mime) {
   if (mime.includes('quicktime')) return 'mov';
   return 'mp4';
 }
+
 function extForAudioMime(mime) {
   if (!mime) return 'webm';
   if (mime.includes('mp4')) return 'm4a';
@@ -670,8 +664,6 @@ async function shareText(text, files) {
     } catch (e) {
       if (e && e.name === 'AbortError') return 'cancelled';
       if (includeFiles) {
-        // canShare() said yes but the platform still rejected it — canShare()
-        // can't be trusted on this browser; stop attempting files this session.
         fileShareUnreliable = true;
         return 'file-share-unreliable';
       }
@@ -689,9 +681,9 @@ async function shareText(text, files) {
 
 function reportShareResult(result) {
   if (result === 'text-only') {
-    statusEl.textContent = "Shared the text — this browser can't attach the photo/video/audio automatically, so attach them separately.";
+    statusEl.textContent = "Shared the text — this browser can't attach the photo/audio automatically, so attach them separately.";
   } else if (result === 'file-share-unreliable') {
-    statusEl.textContent = 'This browser rejected the attachment — sharing text only for the rest of this session. Use Save to keep the photo/video/audio.';
+    statusEl.textContent = 'This browser rejected the attachment — sharing text only for the rest of this session. Use Save to keep the photo/audio.';
   } else if (result === 'clipboard') {
     statusEl.textContent = 'Sharing not supported here — copied to clipboard instead.';
   } else if (typeof result === 'string' && result.startsWith('error:')) {
@@ -754,35 +746,11 @@ function saveToHistory(transcript, summary, photo, title) {
   history.unshift({ id, date: new Date().toISOString(), transcript, summary, photo: photo || null, title: title || '' });
   while (history.length > MAX_HISTORY) history.pop();
   const ok = safeSet(HISTORY_KEY, JSON.stringify(history));
-  incrementNoteCounter();
   if (historyPanel.classList.contains('show')) renderHistory();
   return { ok, id };
 }
 
-// backup reminder — tracked via a monotonic counter, not history.length,
-// so deleting notes or aging past the 50-note cap doesn't hide the reminder
-function getNoteCounter() { return parseInt(localStorage.getItem(NOTE_COUNTER_KEY) || '0', 10); }
-function incrementNoteCounter() { safeSet(NOTE_COUNTER_KEY, String(getNoteCounter() + 1)); }
-function getBackupMarker() { return parseInt(localStorage.getItem(BACKUP_MARKER_KEY) || '0', 10); }
-function markBackedUp() { safeSet(BACKUP_MARKER_KEY, String(getNoteCounter())); updateBackupReminder(); }
-
-function updateBackupReminder() {
-  const since = getNoteCounter() - getBackupMarker();
-  if (since < BACKUP_REMINDER_THRESHOLD) {
-    hide(backupReminderEl);
-    return;
-  }
-  backupReminderEl.innerHTML = `<p>${since} new notes since your last backup — want to back them up?</p>`;
-  const btn = document.createElement('button');
-  btn.textContent = 'Share Backup';
-  btn.setAttribute('data-color', 'blue');
-  btn.addEventListener('click', () => shareBackupBtn.click());
-  backupReminderEl.appendChild(btn);
-  show(backupReminderEl);
-}
-
 function renderHistory() {
-  updateBackupReminder();
   const query = historySearchEl.value.trim().toLowerCase();
   let history = loadHistory();
   if (query) {
@@ -884,7 +852,6 @@ exportBtn.addEventListener('click', () => {
     return;
   }
   downloadFile(`voicenote-history-${timestamp()}.json`, JSON.stringify(history, null, 2), 'application/json');
-  markBackedUp();
   statusEl.textContent = `Exported ${history.length} note(s).`;
 });
 
@@ -901,7 +868,6 @@ shareBackupBtn.addEventListener('click', async () => {
   );
   const result = await shareText(`Voice Note history backup — ${history.length} note(s)`, [file]);
   if (result === 'shared') {
-    markBackedUp();
     statusEl.textContent = 'Backup shared.';
   } else if (result === 'text-only' || result === 'file-share-unreliable') {
     statusEl.textContent = "This browser can't share the backup file directly — use Export All to download it instead.";

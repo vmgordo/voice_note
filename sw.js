@@ -1,5 +1,5 @@
-const CACHE = 'voicenote-shell-v1';
-const CDN_CACHE = 'voicenote-cdn-v1';
+const CACHE = 'voicenote-shell-stable-v2';
+const CDN_CACHE = 'voicenote-cdn-stable-v2';
 const SHELL = ['./', './index.html', './app.js', './manifest.json', './icon-192.png', './icon-512.png'];
 
 self.addEventListener('install', (e) => {
@@ -20,10 +20,6 @@ self.addEventListener('fetch', (e) => {
   }
 
   if (url.hostname === 'cdn.jsdelivr.net') {
-    // the transformers.js library itself — cache-first at runtime so the app
-    // still loads offline even if the browser's own HTTP cache evicts it.
-    // Model weight files (a different host) are left alone — transformers.js
-    // manages their caching itself.
     e.respondWith(
       caches.open(CDN_CACHE).then(async (cache) => {
         const cached = await cache.match(e.request);
