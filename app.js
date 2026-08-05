@@ -681,9 +681,9 @@ async function shareText(text, files) {
 
 function reportShareResult(result) {
   if (result === 'text-only') {
-    statusEl.textContent = "Shared the text — this browser can't attach the photo/audio automatically, so attach them separately.";
+    statusEl.textContent = "Shared the text — this browser can't attach the photo/video automatically, so attach them separately.";
   } else if (result === 'file-share-unreliable') {
-    statusEl.textContent = 'This browser rejected the attachment — sharing text only for the rest of this session. Use Save to keep the photo/audio.';
+    statusEl.textContent = 'This browser rejected the attachment — sharing text only for the rest of this session. Use Save to keep the photo/video/audio.';
   } else if (result === 'clipboard') {
     statusEl.textContent = 'Sharing not supported here — copied to clipboard instead.';
   } else if (typeof result === 'string' && result.startsWith('error:')) {
@@ -693,15 +693,16 @@ function reportShareResult(result) {
 }
 
 shareBtn.addEventListener('click', async () => {
+  // Audio is deliberately left out of Share (though Save still includes
+  // it): testing showed that bundling an audio file alongside photo/video
+  // caused WhatsApp's share handler to reject the whole attachment set and
+  // fall back to text-only — likely because it doesn't recognize the audio
+  // MIME type and bails on the entire file array rather than skipping just
+  // that one. Photo/video together are far more broadly supported.
   const files = [];
   if (photoBlob) files.push(photoBlob);
   if (videoBlob) {
     files.push(new File([videoBlob], `voicenote-video.${extForVideoMime(videoBlob.type)}`, { type: videoBlob.type || 'video/mp4' }));
-  }
-  if (lastRecordingBlob) {
-    files.push(new File([lastRecordingBlob], `voicenote-audio.${extForAudioMime(recordMimeType)}`, {
-      type: recordMimeType || 'audio/webm',
-    }));
   }
   const result = await shareText(summaryEl.value, files);
   reportShareResult(result);

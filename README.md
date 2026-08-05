@@ -62,3 +62,13 @@ Deploy via GitHub Pages, same as before — root of the repo, no subfolder.
   `localStorage`) — same as the audio recording.
 - **Share and Save now include text, photo, video, and audio together**
   — whichever are currently attached.
+
+## Update: audio dropped from Share (kept in Save)
+
+Testing on a real device showed WhatsApp's share handler rejecting the
+*entire* attachment set (falling back to text-only) when an audio file
+was bundled alongside photo/video — most likely because it doesn't
+recognize the audio MIME type and bails on the whole array rather than
+skipping just that item. Share now sends text + photo + video only.
+**Save is unaffected and still includes the audio recording** — if you
+need to send the audio itself, use Save and attach that file manually.
